@@ -2,7 +2,7 @@
 
 This is a vibe-coded mess of half-assed attempts at porting [Patrick Gillespie's script](https://github.com/patorjk/video-to-turing-pattern/) to my AMD GPU.
 
-It uses ROCm because I'm too poor for an NVIDIA GPU, and the codebase is really janky but just because this is on the GPU it's still a bajillion times faster than the original script.
+It uses ROCm in WSL because I'm too poor for an NVIDIA GPU, and the codebase is really janky but just because this is on the GPU it's still a bajillion times faster than the original script. This project is public domain.
 
 # Installation & Use
 
