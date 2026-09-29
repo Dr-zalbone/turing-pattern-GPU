@@ -1,6 +1,6 @@
 # A Turing pattern generator using repeated sharpen and blur effects #
 
-This is a vibe-coded mess of half-assed attempts at "porting" and "optimizing" a cool script I saw from Patrick Gillespie [here.](https://github.com/pmneila/jsexp)
+This is a vibe-coded mess of half-assed attempts at "porting" and "optimizing" a cool script I saw from Patrick Gillespie [here.](https://github.com/patorjk/video-to-turing-pattern/)
 
 It uses ROCm because I'm too poor for an NVIDIA GPU, and this project is dead on arrival because I'm done with this BS.
 
