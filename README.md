@@ -8,9 +8,7 @@ It's still much, much faster than the script from him, but it's much jankier and
 
 Also, the Python one isn't really complete.
 
-This is built for Linux (I'm using WSL), and 
-
-Feel free to use this as a reference on how not to make a port; this is public domain.
+This is built for Linux (I'm using WSL), and Feel free to use this as a reference on how not to make a port; this is public domain.
 
 # Installation & Use
 
