@@ -1,14 +1,8 @@
-# A Turing pattern generator using repeated sharpen and blur effects #
+# A GPU port of a Turing pattern generator #
 
-This is a vibe-coded mess of half-assed attempts at "porting" and "optimizing" a cool script I saw from Patrick Gillespie [here.](https://github.com/patorjk/video-to-turing-pattern/)
+This is a vibe-coded mess of half-assed attempts at porting [Patrick Gillespie's script](https://github.com/patorjk/video-to-turing-pattern/) to my AMD GPU.
 
-It uses ROCm because I'm too poor for an NVIDIA GPU, and this project is dead on arrival because I'm done with this BS.
-
-It's still much, much faster than the script from him, but it's much jankier and with much more room for improvement than his version. The simple fact that this is a successful port to GPU makes up for the poor, vibe-coded codebase.
-
-Also, the Python one isn't really complete.
-
-This is built for Linux (I'm using WSL), and Feel free to use this as a reference on how not to make a port; this is public domain.
+It uses ROCm because I'm too poor for an NVIDIA GPU, and the codebase is really janky but just because this is on the GPU it's still a bajillion times faster than the original script.
 
 # Installation & Use
 
