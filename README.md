@@ -35,6 +35,10 @@ hipcc --version
 rocminfo
 
 ```
+If you are having trouble, there is an official guide on how to install ROCm [here.](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html)
+> [!WARNING]
+> Though, note that the guide wasn't enough for me, and you will probably have a very specific and stupid problem with your installation that will make the setup process a living hell and drain hours of your precious and finite life.
+
 ## Compilation
 
 Build the live camera application:
@@ -50,10 +54,6 @@ Build the batch file processor:
 hipcc -O3 -ffast-math turing.cpp -o turing
 
 ```
-If you are having trouble, there is an official guide on how to install ROCm [here.](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html)
-> [!WARNING]
-> Though, note that the guide wasn't enough for me, and you will probably have a very specific and stupid problem with your installation that will make the setup process a living hell and drain hours of your precious and finite life.
-
 ---
 
 ## Execution
