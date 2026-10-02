@@ -3,6 +3,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <string>
+#include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <hip/hip_runtime.h>
@@ -152,7 +154,7 @@ void gpu_thread_func(int width, int height) {
     int display_height = height / 2;
     size_t display_pixels = (size_t)display_width * display_height;
 
-    int iterations = 35;
+    int iterations = 90;
     float sharpen_strength = 5.0f;
 
     unsigned char *h_in_bgr, *h_out_display;
@@ -256,29 +258,45 @@ void generate_gaussian_kernel_1d(float* k, int size, float sigma) {
 }
 
 // --- Stage 3: The Painter (Main UI Thread) ---
-int main() {
-    cv::VideoCapture cap(0, cv::CAP_V4L2);
-    if (!cap.isOpened()) {
-        std::cerr << "Error: Could not open camera." << std::endl;
-        return 1;
+int main(int argc, char** argv) {
+    std::string video_source = (argc > 1) ? argv[1] : "0";
+    cv::VideoCapture cap;
+
+    bool is_device_index = !video_source.empty() && 
+        std::all_of(video_source.begin(), video_source.end(), ::isdigit);
+
+    if (is_device_index) {
+        int dev_id = std::stoi(video_source);
+        cap.open(dev_id, cv::CAP_V4L2);
+        if (!cap.isOpened()) {
+            std::cerr << "Error: Could not open camera device " << dev_id << std::endl;
+            return 1;
+        }
+
+        int width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+        int height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
+
+        if (fourcc_code != cv::VideoWriter::fourcc('M', 'J', 'P', 'G') || width != 1920 || height != 1080) {
+            cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+            cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+            cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+            cap.set(cv::CAP_PROP_FPS, 30);
+        }
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    } else {
+        std::cout << "Connecting to stream: " << video_source << std::endl;
+        cap.open(video_source, cv::CAP_FFMPEG);
+        if (!cap.isOpened()) {
+            std::cerr << "Error: Could not connect to stream " << video_source << std::endl;
+            return 1;
+        }
     }
 
     int width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
     int height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-    int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
-
-    if (fourcc_code != cv::VideoWriter::fourcc('M', 'J', 'P', 'G') || width != 1920 || height != 1080) {
-        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-        cap.set(cv::CAP_PROP_FPS, 30);
-    }
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-
-    width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-    height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
     double cam_fps = cap.get(cv::CAP_PROP_FPS);
-    fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
+    int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
     char fourcc_str[] = {
         (char)(fourcc_code & 0XFF),
         (char)((fourcc_code >> 8) & 0XFF),
@@ -286,7 +304,7 @@ int main() {
         (char)((fourcc_code >> 24) & 0XFF),
         0
     };
-    std::cout << "Camera initialized: " << width << "x" << height 
+    std::cout << "Stream connected: " << width << "x" << height 
               << " @ " << cam_fps << " FPS, FOURCC: " << fourcc_str << std::endl;
 
     float h_k5_1d[5], h_k7_1d[7];
