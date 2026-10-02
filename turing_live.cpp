@@ -26,15 +26,29 @@ __global__ void preprocess_bgr_kernel(const unsigned char* in_bgr, float* out_gr
     }
 }
 
-__global__ void blur_1d_h_kernel(const float* in, float* out, int width, int height, const float* __restrict__ kernel, int radius) {
+__global__ void blur_1d_h_k5_kernel(const float* in, float* out, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x < width && y < height) {
         float sum = 0.0f;
         int row_offset = y * width;
-        for (int k = -radius; k <= radius; ++k) {
+        for (int k = -2; k <= 2; ++k) {
             int px = min(max(x + k, 0), width - 1);
-            sum += in[row_offset + px] * kernel[k + radius];
+            sum += in[row_offset + px] * d_k5_1d[k + 2];
+        }
+        out[row_offset + x] = sum;
+    }
+}
+
+__global__ void blur_1d_h_k7_kernel(const float* in, float* out, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < width && y < height) {
+        float sum = 0.0f;
+        int row_offset = y * width;
+        for (int k = -3; k <= 3; ++k) {
+            int px = min(max(x + k, 0), width - 1);
+            sum += in[row_offset + px] * d_k7_1d[k + 3];
         }
         out[row_offset + x] = sum;
     }
@@ -108,12 +122,13 @@ void camera_thread_func(cv::VideoCapture* cap) {
 
     while (system_running) {
         if (!cap->read(acquired_frame) || acquired_frame.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
 
         {
             std::lock_guard<std::mutex> lock(raw_mutex);
-            std::swap(shared_raw_frame, acquired_frame);
+            acquired_frame.copyTo(shared_raw_frame);
             new_raw_ready = true;
         }
         raw_cv.notify_one();
@@ -188,10 +203,10 @@ void gpu_thread_func(int width, int height) {
         hipLaunchKernelGGL(preprocess_bgr_kernel, dim3(blocks1D), dim3(threads1D), 0, compute_stream, d_in_bgr, d_bufA, pixels);
 
         for (int i = 0; i < iterations; ++i) {
-            hipLaunchKernelGGL(blur_1d_h_kernel, grid2D, block2D, 0, compute_stream, d_bufA, d_temp, width, height, d_k5_1d, 2);
+            hipLaunchKernelGGL(blur_1d_h_k5_kernel, grid2D, block2D, 0, compute_stream, d_bufA, d_temp, width, height);
             hipLaunchKernelGGL(unsharp_v_kernel, grid2D, block2D, 0, compute_stream, d_bufA, d_temp, d_bufB, width, height, sharpen_strength);
 
-            hipLaunchKernelGGL(blur_1d_h_kernel, grid2D, block2D, 0, compute_stream, d_bufB, d_temp, width, height, d_k7_1d, 3);
+            hipLaunchKernelGGL(blur_1d_h_k7_kernel, grid2D, block2D, 0, compute_stream, d_bufB, d_temp, width, height);
             hipLaunchKernelGGL(diffusion_v_kernel, grid2D, block2D, 0, compute_stream, d_temp, d_bufA, width, height);
         }
 
@@ -244,16 +259,22 @@ int main() {
         return 1;
     }
 
-    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-    cap.set(cv::CAP_PROP_FPS, 30);
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-
     int width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
     int height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-    double cam_fps = cap.get(cv::CAP_PROP_FPS);
     int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
+
+    if (fourcc_code != cv::VideoWriter::fourcc('M', 'J', 'P', 'G') || width != 1920 || height != 1080) {
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+        cap.set(cv::CAP_PROP_FPS, 30);
+    }
+    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+
+    width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    double cam_fps = cap.get(cv::CAP_PROP_FPS);
+    fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
     char fourcc_str[] = {
         (char)(fourcc_code & 0XFF),
         (char)((fourcc_code >> 8) & 0XFF),
