@@ -1,6 +1,7 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
 #include <iomanip>
@@ -88,25 +89,44 @@ __global__ void postprocess_downscale_half_kernel(const float* in, unsigned char
 
 // --- Threading Variables ---
 std::mutex raw_mutex;
+std::condition_variable raw_cv;
 cv::Mat shared_raw_frame;
-std::atomic<bool> new_raw_ready(false);
+bool new_raw_ready = false;
 
 std::mutex display_mutex;
+std::condition_variable display_cv;
 cv::Mat shared_display_frame;
-std::atomic<bool> new_display_ready(false);
+bool new_display_ready = false;
 
 std::atomic<bool> system_running(true);
 
 // --- Stage 1: The Harvester (Camera Thread) ---
 void camera_thread_func(cv::VideoCapture* cap) {
-    cv::Mat temp_frame;
-    while (system_running) {
-        (*cap) >> temp_frame;
-        if (temp_frame.empty()) continue;
+    cv::Mat acquired_frame;
+    auto last_time = std::chrono::high_resolution_clock::now();
+    int frame_count = 0;
 
-        std::lock_guard<std::mutex> lock(raw_mutex);
-        temp_frame.copyTo(shared_raw_frame);
-        new_raw_ready = true;
+    while (system_running) {
+        if (!cap->read(acquired_frame) || acquired_frame.empty()) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(raw_mutex);
+            std::swap(shared_raw_frame, acquired_frame);
+            new_raw_ready = true;
+        }
+        raw_cv.notify_one();
+
+        frame_count++;
+        auto current_time = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(current_time - last_time).count();
+        if (elapsed >= 2.0) {
+            std::cout << "[Camera Ingest]: " << std::fixed << std::setprecision(1) 
+                      << (frame_count / elapsed) << " FPS" << std::endl;
+            frame_count = 0;
+            last_time = current_time;
+        }
     }
 }
 
@@ -140,7 +160,7 @@ void gpu_thread_func(int width, int height) {
     int blocks1D = (pixels + threads1D - 1) / threads1D;
 
     cv::Mat local_raw;
-    cv::Mat out_display_mat(display_height, display_width, CV_8UC1, h_out_display);
+    cv::Mat local_out_display(display_height, display_width, CV_8UC1);
 
     auto last_time = std::chrono::high_resolution_clock::now();
     int frame_count = 0;
@@ -149,19 +169,17 @@ void gpu_thread_func(int width, int height) {
     CHECK_HIP(hipStreamCreate(&compute_stream));
 
     while (system_running) {
-        bool got_new = false;
         {
-            std::lock_guard<std::mutex> lock(raw_mutex);
-            if (new_raw_ready) {
-                shared_raw_frame.copyTo(local_raw);
-                new_raw_ready = false;
-                got_new = true;
-            }
-        }
+            std::unique_lock<std::mutex> lock(raw_mutex);
+            raw_cv.wait_for(lock, std::chrono::milliseconds(50), [] {
+                return new_raw_ready || !system_running;
+            });
 
-        if (!got_new || local_raw.empty()) {
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
-            continue;
+            if (!system_running) break;
+            if (!new_raw_ready || shared_raw_frame.empty()) continue;
+
+            std::swap(local_raw, shared_raw_frame);
+            new_raw_ready = false;
         }
 
         memcpy(h_in_bgr, local_raw.data, pixels * 3);
@@ -182,17 +200,21 @@ void gpu_thread_func(int width, int height) {
         CHECK_HIP(hipMemcpyAsync(h_out_display, d_out_display, display_pixels, hipMemcpyDeviceToHost, compute_stream));
         CHECK_HIP(hipStreamSynchronize(compute_stream));
 
+        memcpy(local_out_display.data, h_out_display, display_pixels);
+
         {
             std::lock_guard<std::mutex> lock(display_mutex);
-            out_display_mat.copyTo(shared_display_frame);
+            std::swap(shared_display_frame, local_out_display);
             new_display_ready = true;
         }
+        display_cv.notify_one();
 
         frame_count++;
         auto current_time = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(current_time - last_time).count();
-        if (elapsed >= 1.0) {
-            std::cout << "\rTrue GPU Compute: " << std::fixed << std::setprecision(1) << (frame_count / elapsed) << " FPS   " << std::flush;
+        if (elapsed >= 2.0) {
+            std::cout << "[GPU Pipeline]:  " << std::fixed << std::setprecision(1) 
+                      << (frame_count / elapsed) << " FPS" << std::endl;
             frame_count = 0;
             last_time = current_time;
         }
@@ -222,14 +244,25 @@ int main() {
         return 1;
     }
 
-    // Force Format Order to bypass V4L2 5-FPS limit
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
     cap.set(cv::CAP_PROP_FPS, 30);
+    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
 
-    int width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
-    int height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    int width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    double cam_fps = cap.get(cv::CAP_PROP_FPS);
+    int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
+    char fourcc_str[] = {
+        (char)(fourcc_code & 0XFF),
+        (char)((fourcc_code >> 8) & 0XFF),
+        (char)((fourcc_code >> 16) & 0XFF),
+        (char)((fourcc_code >> 24) & 0XFF),
+        0
+    };
+    std::cout << "Camera initialized: " << width << "x" << height 
+              << " @ " << cam_fps << " FPS, FOURCC: " << fourcc_str << std::endl;
 
     float h_k5_1d[5], h_k7_1d[7];
     generate_gaussian_kernel_1d(h_k5_1d, 5, 1.0f);
@@ -244,22 +277,36 @@ int main() {
 
     cv::namedWindow("Turing Camera", cv::WINDOW_NORMAL);
     cv::Mat local_display;
+    auto last_gui_time = std::chrono::high_resolution_clock::now();
+    int gui_frame_count = 0;
 
     while (true) {
-        bool got_display = false;
         {
-            std::lock_guard<std::mutex> lock(display_mutex);
-            if (new_display_ready) {
-                shared_display_frame.copyTo(local_display);
+            std::unique_lock<std::mutex> lock(display_mutex);
+            display_cv.wait_for(lock, std::chrono::milliseconds(30), [] {
+                return new_display_ready || !system_running;
+            });
+
+            if (!system_running) break;
+
+            if (new_display_ready && !shared_display_frame.empty()) {
+                std::swap(local_display, shared_display_frame);
                 new_display_ready = false;
-                got_display = true;
             }
         }
 
-        if (got_display && !local_display.empty()) {
+        if (!local_display.empty()) {
             cv::imshow("Turing Camera", local_display);
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            gui_frame_count++;
+        }
+
+        auto current_gui_time = std::chrono::high_resolution_clock::now();
+        double gui_elapsed = std::chrono::duration<double>(current_gui_time - last_gui_time).count();
+        if (gui_elapsed >= 2.0) {
+            std::cout << "[GUI Display]:   " << std::fixed << std::setprecision(1) 
+                      << (gui_frame_count / gui_elapsed) << " FPS" << std::endl;
+            gui_frame_count = 0;
+            last_gui_time = current_gui_time;
         }
 
         if (cv::waitKey(1) == 27) break;
