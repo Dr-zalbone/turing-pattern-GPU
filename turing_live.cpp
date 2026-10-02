@@ -117,10 +117,49 @@ bool new_display_ready = false;
 std::atomic<bool> system_running(true);
 
 // --- Stage 1: The Harvester (Camera Thread) ---
-void camera_thread_func(cv::VideoCapture* cap) {
+void camera_thread_func(cv::VideoCapture* cap, bool use_stdin_pipe, int width, int height) {
     cv::Mat acquired_frame;
     auto last_time = std::chrono::high_resolution_clock::now();
     int frame_count = 0;
+
+    if (use_stdin_pipe) {
+        size_t frame_bytes = (size_t)width * height * 3;
+        acquired_frame.create(height, width, CV_8UC3);
+
+        while (system_running) {
+            size_t bytes_read = 0;
+            while (bytes_read < frame_bytes && system_running) {
+                size_t n = fread(acquired_frame.data + bytes_read, 1, frame_bytes - bytes_read, stdin);
+                if (n == 0) {
+                    if (feof(stdin) || ferror(stdin)) {
+                        system_running = false;
+                        break;
+                    }
+                }
+                bytes_read += n;
+            }
+
+            if (!system_running || bytes_read < frame_bytes) break;
+
+            {
+                std::lock_guard<std::mutex> lock(raw_mutex);
+                acquired_frame.copyTo(shared_raw_frame);
+                new_raw_ready = true;
+            }
+            raw_cv.notify_one();
+
+            frame_count++;
+            auto current_time = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(current_time - last_time).count();
+            if (elapsed >= 2.0) {
+                std::cout << "[Pipe Ingest]:   " << std::fixed << std::setprecision(1) 
+                          << (frame_count / elapsed) << " FPS" << std::endl;
+                frame_count = 0;
+                last_time = current_time;
+            }
+        }
+        return;
+    }
 
     while (system_running) {
         if (!cap->read(acquired_frame) || acquired_frame.empty()) {
@@ -261,54 +300,66 @@ void generate_gaussian_kernel_1d(float* k, int size, float sigma) {
 int main(int argc, char** argv) {
     std::string video_source = (argc > 1) ? argv[1] : "0";
     cv::VideoCapture cap;
+    bool use_stdin_pipe = (video_source == "-" || video_source == "pipe" || video_source == "pipe:0");
 
-    bool is_device_index = !video_source.empty() && 
-        std::all_of(video_source.begin(), video_source.end(), ::isdigit);
+    int width = 1920;
+    int height = 1080;
 
-    if (is_device_index) {
-        int dev_id = std::stoi(video_source);
-        cap.open(dev_id, cv::CAP_V4L2);
-        if (!cap.isOpened()) {
-            std::cerr << "Error: Could not open camera device " << dev_id << std::endl;
-            return 1;
+    if (use_stdin_pipe) {
+        if (argc > 3) {
+            width = std::stoi(argv[2]);
+            height = std::stoi(argv[3]);
         }
-
-        int width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-        int height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-        int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
-
-        if (fourcc_code != cv::VideoWriter::fourcc('M', 'J', 'P', 'G') || width != 1920 || height != 1080) {
-            cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-            cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-            cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-            cap.set(cv::CAP_PROP_FPS, 30);
-        }
-        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        std::cout << "Streaming directly from STDIN pipe: " << width << "x" << height << " BGR24" << std::endl;
     } else {
-        std::cout << "Connecting to stream: " << video_source << std::endl;
-        cap.open(video_source, cv::CAP_FFMPEG);
-        if (!cap.isOpened()) {
-            cap.open(video_source);
-        }
-        if (!cap.isOpened()) {
-            std::cerr << "Error: Could not connect to stream " << video_source << std::endl;
-            return 1;
-        }
-    }
+        bool is_device_index = !video_source.empty() && 
+            std::all_of(video_source.begin(), video_source.end(), ::isdigit);
 
-    int width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-    int height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-    double cam_fps = cap.get(cv::CAP_PROP_FPS);
-    int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
-    char fourcc_str[] = {
-        (char)(fourcc_code & 0XFF),
-        (char)((fourcc_code >> 8) & 0XFF),
-        (char)((fourcc_code >> 16) & 0XFF),
-        (char)((fourcc_code >> 24) & 0XFF),
-        0
-    };
-    std::cout << "Stream connected: " << width << "x" << height 
-              << " @ " << cam_fps << " FPS, FOURCC: " << fourcc_str << std::endl;
+        if (is_device_index) {
+            int dev_id = std::stoi(video_source);
+            cap.open(dev_id, cv::CAP_V4L2);
+            if (!cap.isOpened()) {
+                std::cerr << "Error: Could not open camera device " << dev_id << std::endl;
+                return 1;
+            }
+
+            int dev_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+            int dev_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+            int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
+
+            if (fourcc_code != cv::VideoWriter::fourcc('M', 'J', 'P', 'G') || dev_w != 1920 || dev_h != 1080) {
+                cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+                cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+                cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+                cap.set(cv::CAP_PROP_FPS, 30);
+            }
+            cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        } else {
+            std::cout << "Connecting to stream: " << video_source << std::endl;
+            cap.open(video_source, cv::CAP_FFMPEG);
+            if (!cap.isOpened()) {
+                cap.open(video_source);
+            }
+            if (!cap.isOpened()) {
+                std::cerr << "Error: Could not connect to stream " << video_source << std::endl;
+                return 1;
+            }
+        }
+
+        width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+        height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        double cam_fps = cap.get(cv::CAP_PROP_FPS);
+        int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
+        char fourcc_str[] = {
+            (char)(fourcc_code & 0XFF),
+            (char)((fourcc_code >> 8) & 0XFF),
+            (char)((fourcc_code >> 16) & 0XFF),
+            (char)((fourcc_code >> 24) & 0XFF),
+            0
+        };
+        std::cout << "Stream connected: " << width << "x" << height 
+                  << " @ " << cam_fps << " FPS, FOURCC: " << fourcc_str << std::endl;
+    }
 
     float h_k5_1d[5], h_k7_1d[7];
     generate_gaussian_kernel_1d(h_k5_1d, 5, 1.0f);
@@ -318,7 +369,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Starting GUI Pipeline. Press ESC in the window to exit." << std::endl;
 
-    std::thread cam_thread(camera_thread_func, &cap);
+    std::thread cam_thread(camera_thread_func, &cap, use_stdin_pipe, width, height);
     std::thread compute_thread(gpu_thread_func, width, height);
 
     cv::namedWindow("Turing Camera", cv::WINDOW_NORMAL);
@@ -362,7 +413,7 @@ int main(int argc, char** argv) {
     cam_thread.join();
     compute_thread.join();
     
-    cap.release();
+    if (cap.isOpened()) cap.release();
     cv::destroyAllWindows();
     std::cout << "\nSuccessfully shut down." << std::endl;
 
