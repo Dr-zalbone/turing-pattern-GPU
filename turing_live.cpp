@@ -193,8 +193,12 @@ void gpu_thread_func(int width, int height) {
             if (!system_running) break;
             if (!new_raw_ready || shared_raw_frame.empty()) continue;
 
-            std::swap(local_raw, shared_raw_frame);
+            shared_raw_frame.copyTo(local_raw);
             new_raw_ready = false;
+        }
+
+        if (local_raw.empty() || local_raw.cols != width || local_raw.rows != height) {
+            continue;
         }
 
         memcpy(h_in_bgr, local_raw.data, pixels * 3);
@@ -219,7 +223,7 @@ void gpu_thread_func(int width, int height) {
 
         {
             std::lock_guard<std::mutex> lock(display_mutex);
-            std::swap(shared_display_frame, local_out_display);
+            local_out_display.copyTo(shared_display_frame);
             new_display_ready = true;
         }
         display_cv.notify_one();
@@ -311,7 +315,7 @@ int main() {
             if (!system_running) break;
 
             if (new_display_ready && !shared_display_frame.empty()) {
-                std::swap(local_display, shared_display_frame);
+                shared_display_frame.copyTo(local_display);
                 new_display_ready = false;
             }
         }
