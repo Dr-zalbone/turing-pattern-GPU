@@ -317,23 +317,30 @@ int main(int argc, char** argv) {
 
         if (is_device_index) {
             int dev_id = std::stoi(video_source);
+#if defined(_WIN32) || defined(_WIN64)
+            cap.open(dev_id, cv::CAP_DSHOW);
+#else
             cap.open(dev_id, cv::CAP_V4L2);
+#endif
             if (!cap.isOpened()) {
                 std::cerr << "Error: Could not open camera device " << dev_id << std::endl;
                 return 1;
             }
 
-            int dev_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-            int dev_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-            int fourcc_code = (int)cap.get(cv::CAP_PROP_FOURCC);
-
-            if (fourcc_code != cv::VideoWriter::fourcc('M', 'J', 'P', 'G') || dev_w != 1920 || dev_h != 1080) {
-                cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-                cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-                cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-                cap.set(cv::CAP_PROP_FPS, 30);
-            }
+            // ORDER MATTERS for OpenCV's DirectShow backend:
+            //  - set(FOURCC) resets its internal m_fourcc to -1 after a successful
+            //    setup, so any later WIDTH/HEIGHT/FPS set() re-creates the stream
+            //    with the *default* subtype (RGB24). The camera then falls back to
+            //    uncompressed YUY2, which saturates USB bandwidth and throttles to
+            //    ~5 FPS.
+            //  - set(FOURCC) must therefore run LAST, after size and FPS are
+            //    negotiated. It re-applies MJPG at the current size while carrying
+            //    over the frame rate negotiated by the previous step.
+            cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
+            cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+            cap.set(cv::CAP_PROP_FPS, 30);
             cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+            cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
         } else {
             std::cout << "Connecting to stream: " << video_source << std::endl;
             cap.open(video_source, cv::CAP_FFMPEG);

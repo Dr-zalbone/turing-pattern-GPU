@@ -1,0 +1,13 @@
+# build outputs
+*.exe
+*.o
+*.obj
+turing
+turing_live
+
+# editor / OS noise
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
