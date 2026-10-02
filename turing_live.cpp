@@ -286,7 +286,15 @@ int main(int argc, char** argv) {
         cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
     } else {
         std::cout << "Connecting to stream: " << video_source << std::endl;
-        cap.open(video_source, cv::CAP_FFMPEG);
+        std::vector<int> capture_params = {
+            cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+            cv::CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+            cv::CAP_PROP_BUFFERSIZE, 1
+        };
+        cap.open(video_source, cv::CAP_ANY, capture_params);
+        if (!cap.isOpened()) {
+            cap.open(video_source);
+        }
         if (!cap.isOpened()) {
             std::cerr << "Error: Could not connect to stream " << video_source << std::endl;
             return 1;
