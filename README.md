@@ -4,7 +4,7 @@ This is a vibe-coded mess of half-assed attempts at porting [Patrick Gillespie's
 
 It uses HIP/ROCm because I'm too poor for an NVIDIA GPU, and the codebase is really janky but just because this is on the GPU it's still a bajillion times faster than the original script. This project is public domain.
 
-The live camera app runs natively on **Windows 11**, so the webcam is read straight through DirectShow. The video file processor still targets Linux/WSL2 with ROCm.
+The live camera app runs natively on **Windows 11**, so the webcam is read straight through DirectShow. The video file processor still targets Linux/WSL2 with ROCm. Single-image (photo) processing shares the video binary and also runs natively on Windows.
 
 # Installation & Use
 
@@ -91,6 +91,24 @@ Build the batch file processor:
 hipcc -O3 -ffast-math turing.cpp -o turing
 
 ```
+
+### Photo processor
+
+Photo mode is compiled into the same `turing.cpp`, so the Linux one-liner above already includes it — and `build_win.bat` builds it natively on Windows as `turing.exe`:
+
+```powershell
+.\build_win.bat            # both targets
+.\build_win.bat turing     # only this one (no OpenCV required for it)
+```
+
+Either way it only needs `ffmpeg` and `ffprobe` on `PATH`:
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+Launch it with `run_turing.bat`, which puts the HIP DLLs on `PATH` for you.
+
 ---
 
 ## Execution
@@ -142,3 +160,24 @@ Example:
 ./turing input.mp4 output.mp4 1920 1080 64
 
 ```
+
+### 3. Photo Processor (`turing`)
+
+Process a single image the same way as a video file, except **the width and height are read from the image itself**, so you normally don't pass them:
+
+```bash
+./turing photo.jpg output.png
+./turing photo.jpg output.png 1600 1200      # optional explicit override
+```
+
+On Windows:
+
+```powershell
+.\run_turing.bat photo.jpg output.png
+```
+
+* **Input** is whatever the *input* extension says it is: `jpg · jpeg · png · bmp · webp · tif · tiff · pgm · ppm`. That is how the binary chooses between photo mode and video mode, so the video invocation above is untouched — point it at a video with no dimensions and you still get exactly the same usage message.
+* **Output** format comes from the *output* extension: `.png` stays grayscale, `.jpg` is JPEG-encoded.
+* Everything else matches video mode — sigma 1.0 / 1.8, sharpen 5.0, 100 iterations, grayscale end to end — because photo mode *is* video mode with `batch_size = 1` and a single still frame pushed through the same `turing_core.h` kernels.
+
+Requires `ffmpeg` and `ffprobe` on `PATH`.

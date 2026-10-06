@@ -10,98 +10,7 @@
 #include <hip/hip_runtime.h>
 #include <opencv2/opencv.hpp>
 
-#define CHECK_HIP(call) do { \
-    hipError_t err = call; \
-    if (err != hipSuccess) { \
-        fprintf(stderr, "HIP Error: %s at %s:%d\n", hipGetErrorString(err), __FILE__, __LINE__); \
-        exit(1); \
-    } \
-} while(0)
-
-__constant__ float d_k5_1d[5];
-__constant__ float d_k7_1d[7];
-
-__global__ void preprocess_bgr_kernel(const unsigned char* in_bgr, float* out_gray, size_t total_elements) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        out_gray[idx] = (0.299f * in_bgr[idx * 3 + 2] + 0.587f * in_bgr[idx * 3 + 1] + 0.114f * in_bgr[idx * 3 + 0]) / 255.0f;
-    }
-}
-
-__global__ void blur_1d_h_k5_kernel(const float* in, float* out, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        float sum = 0.0f;
-        int row_offset = y * width;
-        for (int k = -2; k <= 2; ++k) {
-            int px = min(max(x + k, 0), width - 1);
-            sum += in[row_offset + px] * d_k5_1d[k + 2];
-        }
-        out[row_offset + x] = sum;
-    }
-}
-
-__global__ void blur_1d_h_k7_kernel(const float* in, float* out, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        float sum = 0.0f;
-        int row_offset = y * width;
-        for (int k = -3; k <= 3; ++k) {
-            int px = min(max(x + k, 0), width - 1);
-            sum += in[row_offset + px] * d_k7_1d[k + 3];
-        }
-        out[row_offset + x] = sum;
-    }
-}
-
-__global__ void unsharp_v_kernel(const float* in_orig, const float* in_blurred_h, float* out, int width, int height, float strength) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        float blur_val = 0.0f;
-        for (int k = -2; k <= 2; ++k) {
-            int py = min(max(y + k, 0), height - 1);
-            blur_val += in_blurred_h[py * width + x] * d_k5_1d[k + 2];
-        }
-        float current = in_orig[y * width + x];
-        out[y * width + x] = current + (current - blur_val) * strength;
-    }
-}
-
-__global__ void diffusion_v_kernel(const float* in_blurred_h, float* out, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        float blur_val = 0.0f;
-        for (int k = -3; k <= 3; ++k) {
-            int py = min(max(y + k, 0), height - 1);
-            blur_val += in_blurred_h[py * width + x] * d_k7_1d[k + 3];
-        }
-        out[y * width + x] = fminf(fmaxf(blur_val, 0.0f), 1.0f);
-    }
-}
-
-__global__ void postprocess_downscale_half_kernel(const float* in, unsigned char* out, int src_width, int src_height) {
-    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
-    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
-    int dst_width = src_width / 2;
-    int dst_height = src_height / 2;
-
-    if (out_x < dst_width && out_y < dst_height) {
-        int src_x = out_x * 2;
-        int src_y = out_y * 2;
-
-        float p00 = in[src_y * src_width + src_x];
-        float p10 = in[src_y * src_width + src_x + 1];
-        float p01 = in[(src_y + 1) * src_width + src_x];
-        float p11 = in[(src_y + 1) * src_width + src_x + 1];
-
-        float avg = (p00 + p10 + p01 + p11) * 0.25f;
-        out[out_y * dst_width + out_x] = (unsigned char)(fminf(fmaxf(avg, 0.0f), 1.0f) * 255.0f);
-    }
-}
+#include "turing_core.h"
 
 // --- Threading Variables ---
 std::mutex raw_mutex;
@@ -193,8 +102,8 @@ void gpu_thread_func(int width, int height) {
     int display_height = height / 2;
     size_t display_pixels = (size_t)display_width * display_height;
 
-    int iterations = 90;
-    float sharpen_strength = 5.0f;
+    int iterations = TURING_ITERS_LIVE;
+    float sharpen_strength = TURING_SHARPEN;
 
     unsigned char *h_in_bgr, *h_out_display;
     CHECK_HIP(hipHostMalloc(&h_in_bgr, pixels * 3));
@@ -208,12 +117,12 @@ void gpu_thread_func(int width, int height) {
     CHECK_HIP(hipMalloc(&d_bufB, pixels * sizeof(float)));
     CHECK_HIP(hipMalloc(&d_temp, pixels * sizeof(float)));
 
-    dim3 block2D(16, 16);
-    dim3 grid2D((width + block2D.x - 1) / block2D.x, (height + block2D.y - 1) / block2D.y);
-    dim3 grid_display((display_width + block2D.x - 1) / block2D.x, (display_height + block2D.y - 1) / block2D.y);
+    dim3 block2D = turing_block_2d();
+    dim3 grid2D = turing_grid_2d(width, height);
+    dim3 grid_display = turing_grid_2d(display_width, display_height);
 
-    int threads1D = 256;
-    int blocks1D = (pixels + threads1D - 1) / threads1D;
+    int threads1D = TURING_BLOCK_THREADS;
+    int blocks1D = turing_blocks_1d(pixels);
 
     cv::Mat local_raw;
     cv::Mat local_out_display(display_height, display_width, CV_8UC1);
@@ -283,17 +192,6 @@ void gpu_thread_func(int width, int height) {
     hipStreamDestroy(compute_stream);
     hipFree(d_in_bgr); hipFree(d_out_display); hipFree(d_bufA); hipFree(d_bufB); hipFree(d_temp);
     hipHostFree(h_in_bgr); hipHostFree(h_out_display);
-}
-
-void generate_gaussian_kernel_1d(float* k, int size, float sigma) {
-    float sum = 0.0f;
-    int center = size / 2;
-    for (int i = -center; i <= center; ++i) {
-        float val = expf(-(i * i) / (2.0f * sigma * sigma));
-        k[i + center] = val;
-        sum += val;
-    }
-    for (int i = 0; i < size; ++i) k[i] /= sum;
 }
 
 // --- Stage 3: The Painter (Main UI Thread) ---
@@ -368,11 +266,7 @@ int main(int argc, char** argv) {
                   << " @ " << cam_fps << " FPS, FOURCC: " << fourcc_str << std::endl;
     }
 
-    float h_k5_1d[5], h_k7_1d[7];
-    generate_gaussian_kernel_1d(h_k5_1d, 5, 1.0f);
-    generate_gaussian_kernel_1d(h_k7_1d, 7, 1.8f);
-    CHECK_HIP(hipMemcpyToSymbol(HIP_SYMBOL(d_k5_1d), h_k5_1d, sizeof(float) * 5));
-    CHECK_HIP(hipMemcpyToSymbol(HIP_SYMBOL(d_k7_1d), h_k7_1d, sizeof(float) * 7));
+    upload_gaussian_constants();
 
     std::cout << "Starting GUI Pipeline. Press ESC in the window to exit." << std::endl;
 

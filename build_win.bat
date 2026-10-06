@@ -2,9 +2,25 @@
 setlocal enabledelayedexpansion
 
 REM ============================================================
-REM  build_win.bat - native Windows build of turing_live.exe
+REM  build_win.bat - native Windows build of the turing apps
 REM  Requirements: AMD HIP SDK, VS 2022/2026 (C++ workload), OpenCV
+REM  Usage: build_win.bat            build both targets
+REM         build_win.bat live       camera app only   (needs OpenCV)
+REM         build_win.bat turing     video/photo only  (no OpenCV)
 REM ============================================================
+
+REM --- 0. Select targets ---
+if "%~1"==""        goto :targets_ok
+if /I "%~1"=="live"   goto :targets_ok
+if /I "%~1"=="turing" goto :targets_ok
+echo [ERROR] Unknown target "%~1". Use: live, turing ^(or nothing for both^).
+exit /b 1
+:targets_ok
+
+set "BUILD_LIVE=1"
+set "BUILD_TURING=1"
+if /I "%~1"=="live"   set "BUILD_TURING=0"
+if /I "%~1"=="turing" set "BUILD_LIVE=0"
 
 REM --- 1. Locate Visual Studio (needed for MSVC headers + link libs) ---
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -41,7 +57,9 @@ if %ERRORLEVEL% neq 0 (
 )
 echo [INFO] Using HIP SDK: %HIP_PATH%
 
-REM --- 3. Locate OpenCV ---
+REM --- 3. Locate OpenCV (only the camera app links it) ---
+if "%BUILD_LIVE%"=="0" goto :skip_opencv
+
 if "%OPENCV_DIR%"=="" (
     if exist "C:\opencv\build" (set "OPENCV_DIR=C:\opencv\build") else if exist "%USERPROFILE%\opencv\build" (set "OPENCV_DIR=%USERPROFILE%\opencv\build")
 )
@@ -72,11 +90,14 @@ REM strip trailing backslash (it would escape the closing quote on the -L arg)
 if "!OPENCV_LIB_DIR:~-1!"=="\" set "OPENCV_LIB_DIR=!OPENCV_LIB_DIR:~0,-1!"
 echo [INFO] Using library: %OPENCV_LIB%
 
+:skip_opencv
+
 REM --- 4. Compile ---
 REM  -Ihip_shim          : fixes HIP-wrapper vs MSVC STL 14.51 (VS 2026) cmath clash
 REM  --offload-arch       : gfx1101 = Radeon RX 7700 XT (RDNA3). Change if needed.
 if "%HIP_GPU_ARCH%"=="" set "HIP_GPU_ARCH=gfx1101"
 
+if "%BUILD_LIVE%"=="0" goto :skip_live
 echo [INFO] Compiling turing_live.cpp for %HIP_GPU_ARCH% ...
 hipcc -O3 -ffast-math -std=c++17 -Wno-nan-infinity-disabled ^
     -I"%~dp0hip_shim" --offload-arch=%HIP_GPU_ARCH% ^
@@ -84,10 +105,26 @@ hipcc -O3 -ffast-math -std=c++17 -Wno-nan-infinity-disabled ^
     -I"%OPENCV_DIR%\include" -L"%OPENCV_LIB_DIR%" -l%OPENCV_LIB_NAME%
 
 if %ERRORLEVEL% neq 0 (
-    echo [FAILED] Compilation error.
+    echo [FAILED] Compilation error in turing_live.cpp.
     exit /b 1
 )
 echo [SUCCESS] Built turing_live.exe
+:skip_live
+
+if "%BUILD_TURING%"=="0" goto :skip_turing
+echo [INFO] Compiling turing.cpp for %HIP_GPU_ARCH% ...
+hipcc -O3 -ffast-math -std=c++17 -Wno-nan-infinity-disabled ^
+    -I"%~dp0hip_shim" --offload-arch=%HIP_GPU_ARCH% ^
+    "%~dp0turing.cpp" -o "%~dp0turing.exe"
+
+if %ERRORLEVEL% neq 0 (
+    echo [FAILED] Compilation error in turing.cpp.
+    exit /b 1
+)
+echo [SUCCESS] Built turing.exe
+:skip_turing
+
 echo.
-echo Run it with: run_live.bat
+if "%BUILD_LIVE%"=="1"   echo Run the camera with:  run_live.bat
+if "%BUILD_TURING%"=="1" echo Run the processor with: run_turing.bat
 exit /b 0
