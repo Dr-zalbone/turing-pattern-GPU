@@ -161,6 +161,14 @@ Example:
 
 ```
 
+The output keeps the **source frame rate** — probed with `ffprobe`, so `24`, `30`, `60` and `29.97` (`30000/1001`) all come out right instead of being forced to 30 — and **copies the source audio** across untouched. Pass `--no-audio` (or `-an`) to write a silent video:
+
+```bash
+./turing input.mp4 output.mp4 1920 1080 64 --no-audio
+```
+
+The flag can go anywhere on the command line, and if the source has no audio stream the output simply has none either.
+
 ### 3. Photo Processor (`turing`)
 
 Process a single image the same way as a video file, except **the width and height are read from the image itself**, so you normally don't pass them:

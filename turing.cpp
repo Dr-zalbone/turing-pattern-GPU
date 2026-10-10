@@ -68,6 +68,43 @@ static bool detect_image_size(const std::string& path, int& width, int& height) 
     return width > 0 && height > 0;
 }
 
+// Accept "N" or "N/D" with both parts greater than zero. ffprobe reports
+// r_frame_rate as "0/0" when it genuinely doesn't know, so reject that.
+static bool is_valid_rate(const std::string& s) {
+    size_t slash = s.find('/');
+    std::string num = (slash == std::string::npos) ? s : s.substr(0, slash);
+    std::string den = (slash == std::string::npos) ? "1" : s.substr(slash + 1);
+    if (num.empty() || den.empty()) return false;
+    if (den.find('/') != std::string::npos) return false;   // more than one slash
+    for (char c : num) if (c < '0' || c > '9') return false;
+    for (char c : den) if (c < '0' || c > '9') return false;
+    try { return std::stol(num) > 0 && std::stol(den) > 0; } catch (...) { return false; }
+}
+
+// The source frame rate as a rational, e.g. "30/1", "24000/1001". Passing the
+// rational straight through keeps NTSC rates exact instead of rounding 29.97.
+// Falls back to 30/1 (the old hardcoded value) if ffprobe can't tell us.
+static std::string detect_frame_rate(const std::string& path) {
+    std::string cmd = "ffprobe -v error -select_streams v:0 "
+                      "-show_entries stream=r_frame_rate "
+                      "-of default=noprint_wrappers=1 " + shell_quote(path);
+    FILE* pipe = popen(cmd.c_str(), POPEN_READ);
+    if (!pipe) return "30/1";
+
+    std::string rate = "30/1";
+    char line[128];
+    while (fgets(line, sizeof(line), pipe) != NULL) {
+        if (strncmp(line, "r_frame_rate=", 13) != 0) continue;
+        std::string value = line + 13;
+        while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
+                                  value.back() == ' '  || value.back() == '\t'))
+            value.pop_back();
+        if (is_valid_rate(value)) rate = value;
+    }
+    pclose(pipe);
+    return rate;
+}
+
 long get_total_frames(const std::string& input_path) {
     std::string cmd = "ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 " + shell_quote(input_path);
     FILE* pipe = popen(cmd.c_str(), POPEN_READ);
@@ -106,7 +143,8 @@ void draw_progress_bar(long current, long total, double elapsed_seconds) {
 }
 
 static void print_usage_video() {
-    std::cerr << "Usage: ./turing <input> <output> <width> <height> [batch_size]\n";
+    std::cerr << "Usage: ./turing <input> <output> <width> <height> [batch_size]\n"
+              << "       [--no-audio]  don't copy the source audio into the output\n";
 }
 
 static void print_usage_photo() {
@@ -115,18 +153,29 @@ static void print_usage_photo() {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        if (argc >= 2 && has_image_extension(argv[1])) print_usage_photo();
-        else                                             print_usage_video();
+    // Flags may appear anywhere on the command line and are stripped first, so
+    // every positional argument keeps the position it has always had.
+    bool copy_audio = true;
+    std::vector<const char*> pos;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--no-audio" || arg == "-an") { copy_audio = false; continue; }
+        pos.push_back(argv[i]);
+    }
+
+    if (pos.size() < 2) {
+        if (pos.size() == 1 && has_image_extension(pos[0])) print_usage_photo();
+        else                                                 print_usage_video();
         return 1;
     }
 
-    std::string input_path = argv[1];
-    std::string output_path = argv[2];
+    std::string input_path = pos[0];
+    std::string output_path = pos[1];
     bool image_mode = has_image_extension(input_path);
 
     int width = 0, height = 0;
     int batch_size = 1;
+    std::string frame_rate = "30/1";
 
     if (image_mode) {
         if (!has_image_extension(output_path)) {
@@ -134,10 +183,10 @@ int main(int argc, char** argv) {
                          "(png/jpg/bmp/webp/tif), got: " << output_path << "\n";
             return 1;
         }
-        if (argc == 5) {
-            width = std::stoi(argv[3]);
-            height = std::stoi(argv[4]);
-        } else if (argc == 3) {
+        if (pos.size() == 4) {
+            width = std::stoi(pos[2]);
+            height = std::stoi(pos[3]);
+        } else if (pos.size() == 2) {
             if (!detect_image_size(input_path, width, height)) {
                 std::cerr << "Error: could not read image dimensions from " << input_path
                           << ".\nPass them explicitly: ./turing <input> <output> <width> <height>\n";
@@ -150,13 +199,14 @@ int main(int argc, char** argv) {
         }
         batch_size = 1;
     } else {
-        if (argc < 5 || argc > 6) {
+        if (pos.size() < 4 || pos.size() > 5) {
             print_usage_video();
             return 1;
         }
-        width = std::stoi(argv[3]);
-        height = std::stoi(argv[4]);
-        batch_size = (argc == 6) ? std::stoi(argv[5]) : 32;
+        width = std::stoi(pos[2]);
+        height = std::stoi(pos[3]);
+        batch_size = (pos.size() == 5) ? std::stoi(pos[4]) : 32;
+        frame_rate = detect_frame_rate(input_path);
     }
 
     size_t pixels_per_frame = width * height;
@@ -193,10 +243,19 @@ int main(int argc, char** argv) {
     } else {
         read_cmd  = "ffmpeg -v error -i " + shell_quote(input_path) +
                     " -f image2pipe -pix_fmt gray -vcodec rawvideo -";
+        // -r sits before -i because it times the raw pipe; the output inherits
+        // that rate. For audio the original file is opened as a second input
+        // and mapped explicitly, so the processed frames remain the only video
+        // stream while its audio is copied across untouched.
         write_cmd = "ffmpeg -v error -y -f rawvideo -vcodec rawvideo -s " +
                     std::to_string(width) + "x" + std::to_string(height) +
-                    " -pix_fmt gray -r 30 -i - -c:v libx264 -preset ultrafast -pix_fmt yuv420p " +
-                    shell_quote(output_path);
+                    " -pix_fmt gray -r " + frame_rate + " -i -";
+        if (copy_audio) {
+            write_cmd += " -i " + shell_quote(input_path) + " -map 0:v -map \"1:a?\"";
+        }
+        write_cmd += " -c:v libx264 -preset ultrafast -pix_fmt yuv420p";
+        if (copy_audio) write_cmd += " -c:a copy";
+        write_cmd += " " + shell_quote(output_path);
     }
 
     FILE* pipe_in = popen(read_cmd.c_str(), POPEN_READ);
