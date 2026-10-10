@@ -2,6 +2,10 @@
 *.exe
 *.o
 *.obj
+*.mp4
+*.jpg
+*.png
+*.mkv
 turing
 turing_live
 
