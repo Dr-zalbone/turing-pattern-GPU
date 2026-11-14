@@ -16,10 +16,32 @@ if not exist "%~dp0turing.exe" (
     exit /b 1
 )
 
-where ffmpeg >nul 2>nul
+REM  A terminal opened before ffmpeg was installed (e.g. by setup_win.ps1) still has the old
+REM  PATH, so also look in winget's install folders (user and machine scope).
+where ffprobe >nul 2>nul
+if errorlevel 1 call :find_ffmpeg
+where ffprobe >nul 2>nul
 if errorlevel 1 (
-    echo [WARNING] ffmpeg not found on PATH. Install it with: winget install Gyan.FFmpeg
+    echo [WARNING] ffmpeg/ffprobe not found. Install with: winget install --id Gyan.FFmpeg -e --source winget
+    echo           then open a new terminal.
 )
 
 "%~dp0turing.exe" %*
 exit /b %ERRORLEVEL%
+
+:find_ffmpeg
+for %%R in ("%LOCALAPPDATA%\Microsoft\WinGet" "%ProgramFiles%\WinGet") do (
+    if exist "%%~R\Links\ffprobe.exe" (
+        set "PATH=%%~R\Links;%PATH%"
+        exit /b 0
+    )
+    for /d %%P in ("%%~R\Packages\Gyan.FFmpeg*") do (
+        for /d %%V in ("%%~P\*") do (
+            if exist "%%~V\bin\ffprobe.exe" (
+                set "PATH=%%~V\bin;%PATH%"
+                exit /b 0
+            )
+        )
+    )
+)
+exit /b 0
