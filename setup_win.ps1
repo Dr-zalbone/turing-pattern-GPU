@@ -82,10 +82,16 @@ function Confirm-Step {
 
 function Invoke-Winget {
     param([string[]]$Arguments)
-    & winget @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        Write-Tag WARN "winget exited with code $LASTEXITCODE; checking the result."
+    # Pin the community 'winget' source. Without it winget also queries 'msstore', which fails on
+    # fresh installs (e.g. 0x8a15005e "server certificate did not match") and aborts with
+    # "Please specify one of them using the --source option".
+    # Out-Host keeps winget's output on screen and out of this function's return value.
+    & winget @Arguments --source winget | Out-Host
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        Write-Tag WARN ('winget exited with code {0} (0x{1:X8}); checking the result.' -f $code, $code)
     }
+    return $code
 }
 
 # ---------------------------------------------------------------- detection
@@ -211,12 +217,15 @@ function Step-VisualStudio {
     if ($SkipInstall) { Write-Tag SKIP 'Visual Studio C++ tools missing; install skipped (-SkipInstall)'; return }
     Confirm-Step 'Install Visual Studio 2022 Build Tools with the C++ workload (large download)?'
     Write-Tag INSTALL 'Visual Studio 2022 Build Tools with the C++ workload (winget)...'
-    Invoke-Winget @(
+    $code = Invoke-Winget @(
         'install', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '-e',
         '--accept-source-agreements', '--accept-package-agreements',
         '--override', '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
     )
-    if (-not (Get-VsInstallPath)) { throw 'Visual Studio C++ tools still not detected after install (a reboot may be required).' }
+    if (-not (Get-VsInstallPath)) {
+        if ($code -ne 0) { throw ('winget could not install Visual Studio Build Tools (exit code 0x{0:X8}). See the winget output above.' -f $code) }
+        throw 'Visual Studio C++ tools still not detected after install (a reboot may be required).'
+    }
     Write-Tag OK 'Visual Studio C++ tools installed'
 }
 
@@ -226,7 +235,7 @@ function Step-Ffmpeg {
     if ($SkipInstall) { Write-Tag SKIP 'ffmpeg missing; install skipped (-SkipInstall)'; return }
     Confirm-Step 'Install ffmpeg (Gyan.FFmpeg) with winget?'
     Write-Tag INSTALL 'ffmpeg (Gyan.FFmpeg) via winget...'
-    Invoke-Winget @('install', '--id', 'Gyan.FFmpeg', '-e', '--accept-source-agreements', '--accept-package-agreements')
+    $null = Invoke-Winget @('install', '--id', 'Gyan.FFmpeg', '-e', '--accept-source-agreements', '--accept-package-agreements')
     Update-SessionPath
     if (Test-Command 'ffmpeg') { Write-Tag OK 'ffmpeg installed' }
     else { Write-Tag WARN 'ffmpeg is not on PATH yet; open a new shell before running run_turing.bat.' }
