@@ -60,12 +60,14 @@ skip() {
 
 # ---- helpers ----------------------------------------------------------------
 # Names of the AMD GPUs rocminfo reports, comma-separated. gfx000 is the CPU
-# agent and is ignored. Empty when no usable GPU is visible.
+# agent and is ignored. Empty when no usable GPU is visible. ROCm uses /dev/kfd
+# on Linux and /dev/dxg under WSL2; rocminfo decides whether either is usable.
 gpu_names() {
-    [ -e /dev/kfd ] || return 0
+    [ -e /dev/kfd ] || [ -e /dev/dxg ] || return 0
     local info
     info="$(rocminfo 2>/dev/null)"
-    grep -oE 'gfx[0-9]+[0-9a-z]*' <<<"$info" | grep -vx 'gfx000' | sort -u | paste -sd, -
+    # Newer ROCm also lists ISA families like "gfx11-generic"; keep only real targets.
+    grep -oE 'gfx[0-9a-z]+(-generic)?' <<<"$info" | grep -v -- '-generic$' | grep -vx 'gfx000' | sort -u | paste -sd, -
 }
 GPU_NAMES="$(gpu_names)"
 

@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
+#include <filesystem>
 #include <string>
 #include <chrono>
 #include <iomanip>
@@ -26,11 +28,47 @@
 #define POPEN_WRITE "w"
 #endif
 
+// Upper bounds for command-line numbers.
+static const long kMaxDim   = 16384;
+static const long kMaxBatch = 1024;
+
 // --- CPU Helpers ---
 
-// Quote a path so it survives both POSIX sh and Windows cmd.exe.
+// Quote a path for the shell that popen() hands the command to.
+// POSIX sh: single quotes, with each embedded ' written as '\''.
+// Windows cmd.exe: double quotes (paths containing " are rejected in main).
 static std::string shell_quote(const std::string& path) {
+#ifdef _WIN32
     return "\"" + path + "\"";
+#else
+    std::string out = "'";
+    for (char c : path) {
+        if (c == '\'') out += "'\\''";
+        else           out += c;
+    }
+    out += "'";
+    return out;
+#endif
+}
+
+// Windows double quoting cannot carry a '"' character. NTFS never allows one in
+// a file name, but a bad argument should still get a clear error, not a broken command.
+static bool path_is_shell_safe(const std::string& path) {
+#ifdef _WIN32
+    return path.find('"') == std::string::npos;
+#else
+    (void)path;
+    return true;
+#endif
+}
+
+// True only when both paths exist and refer to the same file.
+static bool same_file(const std::string& a, const std::string& b) {
+    std::error_code ec;
+    if (!std::filesystem::exists(a, ec) || ec) return false;
+    if (!std::filesystem::exists(b, ec) || ec) return false;
+    bool same = std::filesystem::equivalent(a, b, ec);
+    return same && !ec;
 }
 
 // Photo mode is selected purely by the *input* extension, so the documented
@@ -47,6 +85,27 @@ static bool has_image_extension(const std::string& path) {
     return ext == "jpg"  || ext == "jpeg" || ext == "png"  || ext == "bmp" ||
            ext == "webp" || ext == "tif"  || ext == "tiff" || ext == "pgm"  ||
            ext == "ppm";
+}
+
+// Whole-string integer in [1, max_value]. Rejects "", "abc", "12x", "0", "-3",
+// and values that overflow long.
+static bool parse_int_in_range(const std::string& text, long max_value, int& out) {
+    try {
+        size_t used = 0;
+        long v = std::stol(text, &used, 10);
+        if (used != text.size() || v <= 0 || v > max_value) return false;
+        out = (int)v;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_int_arg(const char* name, const std::string& text, long max_value, int& out) {
+    if (parse_int_in_range(text, max_value, out)) return true;
+    std::cerr << "Error: " << name << " must be a whole number from 1 to " << max_value
+              << ", got: '" << text << "'\n";
+    return false;
 }
 
 // Ask ffprobe for the pixel size of a still image, e.g. "width=1600" /
@@ -83,25 +142,30 @@ static bool is_valid_rate(const std::string& s) {
 
 // The source frame rate as a rational, e.g. "30/1", "24000/1001". Passing the
 // rational straight through keeps NTSC rates exact instead of rounding 29.97.
-// Falls back to 30/1 (the old hardcoded value) if ffprobe can't tell us.
+// Falls back to 30/1 (the old hardcoded value) with a warning if ffprobe can't tell us.
 static std::string detect_frame_rate(const std::string& path) {
     std::string cmd = "ffprobe -v error -select_streams v:0 "
                       "-show_entries stream=r_frame_rate "
                       "-of default=noprint_wrappers=1 " + shell_quote(path);
+    std::string rate;
     FILE* pipe = popen(cmd.c_str(), POPEN_READ);
-    if (!pipe) return "30/1";
-
-    std::string rate = "30/1";
-    char line[128];
-    while (fgets(line, sizeof(line), pipe) != NULL) {
-        if (strncmp(line, "r_frame_rate=", 13) != 0) continue;
-        std::string value = line + 13;
-        while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
-                                  value.back() == ' '  || value.back() == '\t'))
-            value.pop_back();
-        if (is_valid_rate(value)) rate = value;
+    if (pipe) {
+        char line[128];
+        while (fgets(line, sizeof(line), pipe) != NULL) {
+            if (strncmp(line, "r_frame_rate=", 13) != 0) continue;
+            std::string value = line + 13;
+            while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
+                                      value.back() == ' '  || value.back() == '\t'))
+                value.pop_back();
+            if (is_valid_rate(value)) rate = value;
+        }
+        pclose(pipe);
     }
-    pclose(pipe);
+    if (rate.empty()) {
+        std::cerr << "Warning: could not read the frame rate from " << path
+                  << "; assuming 30/1\n";
+        return "30/1";
+    }
     return rate;
 }
 
@@ -119,13 +183,16 @@ long get_total_frames(const std::string& input_path) {
 }
 
 void draw_progress_bar(long current, long total, double elapsed_seconds) {
-    if (total <= 0) return;
+    if (total <= 0 || elapsed_seconds <= 0.0) return;
+    // The packet count can be inaccurate, so keep the bar and ETA in range.
     float progress = (float)current / total;
+    if (progress > 1.0f) progress = 1.0f;
     int barWidth = 40;
-    
+
     double fps = current / elapsed_seconds;
-    double eta_seconds = (total - current) / fps;
-    
+    double eta_seconds = (fps > 0.0) ? (total - current) / fps : 0.0;
+    if (eta_seconds < 0.0) eta_seconds = 0.0;
+
     int eta_m = (int)eta_seconds / 60;
     int eta_s = (int)eta_seconds % 60;
 
@@ -153,6 +220,11 @@ static void print_usage_photo() {
 }
 
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    // A dead encoder should make fwrite() come back short, not kill us with SIGPIPE.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+
     // Flags may appear anywhere on the command line and are stripped first, so
     // every positional argument keeps the position it has always had.
     bool copy_audio = true;
@@ -173,6 +245,16 @@ int main(int argc, char** argv) {
     std::string output_path = pos[1];
     bool image_mode = has_image_extension(input_path);
 
+    if (!path_is_shell_safe(input_path) || !path_is_shell_safe(output_path)) {
+        std::cerr << "Error: paths containing a double quote are not supported on Windows\n";
+        return 1;
+    }
+    // Writing the output would truncate the file ffmpeg is still reading.
+    if (same_file(input_path, output_path)) {
+        std::cerr << "Error: input and output are the same file: " << input_path << "\n";
+        return 1;
+    }
+
     int width = 0, height = 0;
     int batch_size = 1;
     std::string frame_rate = "30/1";
@@ -184,8 +266,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (pos.size() == 4) {
-            width = std::stoi(pos[2]);
-            height = std::stoi(pos[3]);
+            if (!parse_int_arg("width", pos[2], kMaxDim, width) ||
+                !parse_int_arg("height", pos[3], kMaxDim, height)) {
+                print_usage_photo();
+                return 1;
+            }
         } else if (pos.size() == 2) {
             if (!detect_image_size(input_path, width, height)) {
                 std::cerr << "Error: could not read image dimensions from " << input_path
@@ -203,16 +288,27 @@ int main(int argc, char** argv) {
             print_usage_video();
             return 1;
         }
-        width = std::stoi(pos[2]);
-        height = std::stoi(pos[3]);
-        batch_size = (pos.size() == 5) ? std::stoi(pos[4]) : 32;
+        if (!parse_int_arg("width", pos[2], kMaxDim, width) ||
+            !parse_int_arg("height", pos[3], kMaxDim, height)) {
+            print_usage_video();
+            return 1;
+        }
+        batch_size = 32;
+        if (pos.size() == 5 && !parse_int_arg("batch_size", pos[4], kMaxBatch, batch_size)) {
+            print_usage_video();
+            return 1;
+        }
+        if (width % 2 != 0 || height % 2 != 0) {
+            std::cerr << "Error: video output needs even width and height for yuv420p "
+                         "(got " << width << "x" << height << ")\n";
+            return 1;
+        }
         frame_rate = detect_frame_rate(input_path);
     }
 
-    size_t pixels_per_frame = width * height;
-    size_t batch_pixels = pixels_per_frame * batch_size;
+    size_t pixels_per_frame = (size_t)width * (size_t)height;
+    size_t batch_pixels = pixels_per_frame * (size_t)batch_size;
     int iterations = TURING_ITERS_OFFLINE;
-    float sharpen_strength = TURING_SHARPEN;
 
     long total_frames = image_mode ? 0 : get_total_frames(input_path);
 
@@ -223,25 +319,30 @@ int main(int argc, char** argv) {
     CHECK_HIP(hipHostMalloc(&h_out, batch_pixels));
 
     unsigned char *d_in, *d_out;
-    float *d_bufA, *d_bufB, *d_temp;
+    float *d_bufA, *d_bufB;
     CHECK_HIP(hipMalloc(&d_in, batch_pixels));
     CHECK_HIP(hipMalloc(&d_out, batch_pixels));
     CHECK_HIP(hipMalloc(&d_bufA, batch_pixels * sizeof(float)));
     CHECK_HIP(hipMalloc(&d_bufB, batch_pixels * sizeof(float)));
-    CHECK_HIP(hipMalloc(&d_temp, batch_pixels * sizeof(float)));
+
+    // The decoder always scales to the requested size, so the frames match what
+    // turing processes even when the source has different dimensions.
+    std::string scale_filter = " -vf scale=" + std::to_string(width) + ":" + std::to_string(height);
 
     std::string read_cmd, write_cmd;
     if (image_mode) {
         // One still frame in, one still frame out; the encoder is picked from
         // the output extension, and there is no -r / -c:v because it is not a
         // video.
-        read_cmd  = "ffmpeg -v error -i " + shell_quote(input_path) +
+        read_cmd  = "ffmpeg -v error -nostdin -i " + shell_quote(input_path) +
+                    " -frames:v 1" + scale_filter +
                     " -f rawvideo -pix_fmt gray -vcodec rawvideo -";
         write_cmd = "ffmpeg -v error -y -f rawvideo -vcodec rawvideo -s " +
                     std::to_string(width) + "x" + std::to_string(height) +
                     " -pix_fmt gray -i - -frames:v 1 " + shell_quote(output_path);
     } else {
-        read_cmd  = "ffmpeg -v error -i " + shell_quote(input_path) +
+        read_cmd  = "ffmpeg -v error -nostdin -i " + shell_quote(input_path) +
+                    scale_filter +
                     " -f image2pipe -pix_fmt gray -vcodec rawvideo -";
         // -r sits before -i because it times the raw pipe; the output inherits
         // that rate. For audio the original file is opened as a second input
@@ -267,40 +368,39 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    dim3 block2D = turing_block_2d();
     int threads1D = TURING_BLOCK_THREADS;
 
     long processed_frames = 0;
     size_t frames_read = 0;
+    bool write_failed = false;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
     while ((frames_read = fread(h_in, pixels_per_frame, batch_size, pipe_in)) > 0) {
-        
+
         size_t active_pixels = frames_read * pixels_per_frame;
         int blocks1D = turing_blocks_1d(active_pixels);
-        dim3 grid3D = turing_grid_2d(width, height, (int)frames_read);
 
         CHECK_HIP(hipMemcpy(d_in, h_in, active_pixels, hipMemcpyHostToDevice));
-        
+
         hipLaunchKernelGGL(preprocess_gray_kernel, dim3(blocks1D), dim3(threads1D), 0, 0,
                            d_in, d_bufA, active_pixels);
 
-        for (int i = 0; i < iterations; ++i) {
-            hipLaunchKernelGGL(blur_1d_h_k5_kernel, grid3D, block2D, 0, 0, d_bufA, d_temp, width, height);
-            hipLaunchKernelGGL(unsharp_v_kernel,    grid3D, block2D, 0, 0, d_bufA, d_temp, d_bufB, width, height, sharpen_strength);
-            hipLaunchKernelGGL(blur_1d_h_k7_kernel, grid3D, block2D, 0, 0, d_bufB, d_temp, width, height);
-            hipLaunchKernelGGL(diffusion_v_kernel,  grid3D, block2D, 0, 0, d_temp, d_bufA, width, height);
-        }
+        turing_iterate(d_bufA, d_bufB, width, height, (int)frames_read, iterations, 0);
 
         hipLaunchKernelGGL(postprocess_kernel, dim3(blocks1D), dim3(threads1D), 0, 0,
                            d_bufA, d_out, active_pixels);
 
         CHECK_HIP(hipMemcpy(h_out, d_out, active_pixels, hipMemcpyDeviceToHost));
         CHECK_HIP(hipDeviceSynchronize());
-        
-        fwrite(h_out, pixels_per_frame, frames_read, pipe_out);
-        
+
+        size_t written = fwrite(h_out, pixels_per_frame, frames_read, pipe_out);
+        if (written != frames_read) {
+            std::cerr << "\nError: encoder stopped (ffmpeg failed)" << std::endl;
+            write_failed = true;
+            break;
+        }
+
         processed_frames += frames_read;
 
         if (!image_mode) {
@@ -310,24 +410,42 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (image_mode) {
-        if (processed_frames == 0) {
-            std::cerr << "Error: could not decode " << input_path << std::endl;
-        } else {
-            double ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::high_resolution_clock::now() - start_time).count();
-            std::cout << "Processed " << width << "x" << height << " in "
-                      << std::fixed << std::setprecision(1) << ms << " ms -> "
-                      << output_path << std::endl;
+    // Processing time excludes the encoder's final flush in pclose below.
+    auto end_time = std::chrono::high_resolution_clock::now();
+    bool read_failed = ferror(pipe_in) != 0;
+
+    // Close the encoder first: it only finalizes the output file once its stdin
+    // closes, and that wait is where a failed encode shows up as a non-zero status.
+    int enc_status = pclose(pipe_out);
+    int dec_status = pclose(pipe_in);
+
+    bool ok = !write_failed && !read_failed && enc_status == 0 && dec_status == 0 &&
+              processed_frames > 0;
+    if (!ok) {
+        if (!write_failed) {
+            if (read_failed)           std::cerr << "\nError: read error on the decoder pipe" << std::endl;
+            else if (dec_status != 0)  std::cerr << "\nError: ffmpeg could not decode " << input_path << std::endl;
+            else if (enc_status != 0)  std::cerr << "\nError: ffmpeg failed writing " << output_path << std::endl;
+            else                       std::cerr << "\nError: no frames were decoded from " << input_path << std::endl;
         }
-    } else {
-        std::cout << "\nFinished successfully!" << std::endl;
+        (void)hipFree(d_in); (void)hipFree(d_out); (void)hipFree(d_bufA); (void)hipFree(d_bufB);
+        (void)hipHostFree(h_in); (void)hipHostFree(h_out);
+        return 1;
     }
 
-    pclose(pipe_in);
-    pclose(pipe_out);
-    hipFree(d_in); hipFree(d_out); hipFree(d_bufA); hipFree(d_bufB); hipFree(d_temp);
-    hipHostFree(h_in); hipHostFree(h_out);
+    if (image_mode) {
+        double ms = std::chrono::duration<double, std::milli>(
+                        end_time - start_time).count();
+        std::cout << "Processed " << width << "x" << height << " in "
+                  << std::fixed << std::setprecision(1) << ms << " ms -> "
+                  << output_path << std::endl;
+    } else {
+        std::cout << "\n";
+    }
+    std::cout << "Finished successfully!" << std::endl;
 
-    return (image_mode && processed_frames == 0) ? 1 : 0;
+    (void)hipFree(d_in); (void)hipFree(d_out); (void)hipFree(d_bufA); (void)hipFree(d_bufB);
+    (void)hipHostFree(h_in); (void)hipHostFree(h_out);
+
+    return 0;
 }

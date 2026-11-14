@@ -182,6 +182,8 @@ Example:
 
 ```
 
+`width` and `height` set the output size: the source is scaled to it, so they don't have to match the input. Video needs even values (libx264 `yuv420p`). `batch_size` defaults to 32. The program exits non-zero if ffmpeg fails to decode or encode, so it is safe to use in scripts.
+
 The output keeps the **source frame rate**, probed with `ffprobe`, so `24`, `30`, `60` and `29.97` (`30000/1001`) all come out right instead of being forced to 30. It also **copies the source audio** across untouched. Pass `--no-audio` (or `-an`) to write a silent video:
 
 ```bash
@@ -312,6 +314,7 @@ Starting GUI Pipeline. Press ESC in the window to exit.
 ## Design notes
 
 * Two binaries (`turing`, `turing_live`) share the header-only `turing_core.h`, so each builds as a single hipcc translation unit. The separable convolution takes 24 vs 74 MACs/pixel/iteration. Frames are batched via `blockIdx.z`.
+* Each iteration is two LDS-tiled kernels (sharpen, then diffuse), each doing its horizontal and vertical pass in one launch with a clamped halo, so the results match the four-pass version (same edge handling) at about 16 instead of 36 bytes of memory traffic per pixel per iteration. A single fully fused kernel per iteration was tried and was slower: the halo recompute costs more than the saved traffic.
 * Grayscale end to end. ffmpeg/ffprobe pipes handle decode and encode. Photo vs video is chosen by the input extension. The frame rate is kept as an exact rational from ffprobe, and source audio is copied by default.
 * Iterations: 100 offline, 90 live. The live pipeline has 3 threads (ingest, GPU, display). DirectShow MJPG must be set last, or the stream falls back to YUY2 at ~5 FPS.
 * `hip_shim/` is a Windows-only workaround for the HIP wrapper vs MSVC STL 14.51 clash. It is not used in the Linux/Docker build.
