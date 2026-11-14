@@ -358,7 +358,7 @@ function Invoke-Build {
 }
 function Write-NextSteps {
     Write-Host ''
-    Write-Host 'Next steps:'
+    Write-Host 'Next steps (in a NEW terminal if anything was installed, so PATH is up to date):'
     if ($Target -ne 'live') {
         Write-Host '  run_turing.bat input.mp4 output.mp4 1920 1080 64'
         Write-Host '  run_turing.bat photo.jpg output.png'
@@ -380,7 +380,14 @@ function Main {
         $state = Get-SetupState
 
         if ((-not $SkipInstall) -and (Test-NeedsAdmin $state) -and (-not (Test-IsAdmin))) {
-            exit (Invoke-Elevated)
+            $elevatedCode = Invoke-Elevated
+            if ($elevatedCode -eq 0) {
+                Write-Tag OK 'Setup finished in the administrator window.'
+                Write-Tag INFO 'Open a NEW terminal before running run_turing.bat / run_live.bat, so the updated PATH is picked up.'
+            } else {
+                Write-Tag ERROR "Setup failed in the administrator window (exit code $elevatedCode). See that window's output."
+            }
+            exit $elevatedCode
         }
 
         Step-Winget $state

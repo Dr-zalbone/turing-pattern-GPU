@@ -211,6 +211,11 @@ Process a single image the same way as a video file, except **the width and heig
 
 The live camera application and the Windows photo/video processor run natively on Windows 11 with the AMD HIP SDK. Docker cannot give the AMD GPU to ROCm on Windows, so the native build is the GPU path here.
 
+> [!NOTE]
+> Run it on the physical machine with the AMD GPU. Virtual machines (VirtualBox, Hyper-V, VMware) don't expose the GPU to HIP. In a VM the setup and build still work, but `turing.exe` fails with `HIP Error: no ROCm-capable device is detected`.
+>
+> If the setup installed anything, open a new terminal before running `run_turing.bat` or `run_live.bat`, so the updated PATH is picked up.
+
 ### Quick start (setup script)
 
 The setup script installs the Windows toolchain and builds the apps. Run it from the repo folder in PowerShell:
