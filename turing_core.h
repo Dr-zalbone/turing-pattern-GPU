@@ -98,65 +98,133 @@ __global__ void preprocess_bgr_kernel(const unsigned char* in_bgr, float* out_gr
     }
 }
 
-// --- Separable passes -----------------------------------------------------
+// --- Fused separable passes -----------------------------------------------
+// One block computes a TILE_W x TILE_H tile of output. The input tile plus an
+// R-pixel halo is staged into shared memory with clamp-to-edge coordinates,
+// which is exactly what the clamped global reads of the original per-pass
+// kernels did. The horizontal pass is then computed for every staged row and
+// the vertical pass reads those rows from shared memory, so the intermediate
+// buffers never touch global memory.
+//
+// Every thread takes part in the loads and in every __syncthreads(), including
+// threads whose output pixel lies outside the frame. There are no early returns
+// before the barriers.
+//
 // blockIdx.z selects the frame inside a batch.
 
-__global__ void blur_1d_h_k5_kernel(const float* in, float* out, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        size_t base = (size_t)blockIdx.z * width * height;
+constexpr int TURING_TILE_W = 32;    // output tile width  (= blockDim.x)
+constexpr int TURING_TILE_H = 8;     // output tile height (= blockDim.y)
+constexpr int TURING_UNSHARP_R = 2;  // radius of the 5-tap kernel
+constexpr int TURING_DIFF_R    = 3;  // radius of the 7-tap kernel
+
+// Unsharp: 5-tap horizontal + 5-tap vertical blur of A, then the sharpen step.
+// B = A + (A - blur) * strength, with A taken from the staged tile.
+__global__ void unsharp_fused_kernel(const float* __restrict__ A, float* __restrict__ B,
+                                     int width, int height, float strength) {
+    constexpr int R  = TURING_UNSHARP_R;
+    constexpr int K  = 2 * R + 1;
+    constexpr int AW = TURING_TILE_W + 2 * R;
+    constexpr int AH = TURING_TILE_H + 2 * R;
+    __shared__ float sA[AH][AW];            // input tile, clamped at load time
+    __shared__ float sT[AH][TURING_TILE_W]; // horizontal 5-tap of sA
+
+    const int tid  = threadIdx.y * TURING_TILE_W + threadIdx.x;
+    const int nthr = TURING_TILE_W * TURING_TILE_H;
+    const int x0 = blockIdx.x * TURING_TILE_W;
+    const int y0 = blockIdx.y * TURING_TILE_H;
+    const size_t base = (size_t)blockIdx.z * width * height;
+    const float* Ab = A + base;
+    float* Bb = B + base;
+
+    // Stage A with clamp-to-edge coordinates.
+    for (int i = tid; i < AH * AW; i += nthr) {
+        int r = i / AW, c = i % AW;
+        int gy = min(max(y0 - R + r, 0), height - 1);
+        int gx = min(max(x0 - R + c, 0), width - 1);
+        sA[r][c] = Ab[gy * width + gx];
+    }
+    __syncthreads();
+
+    // Horizontal blur for every staged row. Row r therefore equals the original
+    // horizontal pass at clamped row clamp(y0 - R + r).
+    for (int i = tid; i < AH * TURING_TILE_W; i += nthr) {
+        int r = i / TURING_TILE_W, c = i % TURING_TILE_W;
         float sum = 0.0f;
-        for (int k = -2; k <= 2; ++k) {
-            int px = min(max(x + k, 0), width - 1);
-            sum += in[base + y * width + px] * d_k5_1d[k + 2];
-        }
-        out[base + y * width + x] = sum;
+        for (int k = 0; k < K; ++k) sum += sA[r][c + k] * d_k5_1d[k];
+        sT[r][c] = sum;
+    }
+    __syncthreads();
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int x = x0 + tx, y = y0 + ty;
+    if (x < width && y < height) {
+        float blur_val = 0.0f;
+        for (int k = 0; k < K; ++k) blur_val += sT[ty + k][tx] * d_k5_1d[k];
+        float current = sA[ty + R][tx + R];
+        Bb[y * width + x] = current + (current - blur_val) * strength;
     }
 }
 
-__global__ void blur_1d_h_k7_kernel(const float* in, float* out, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        size_t base = (size_t)blockIdx.z * width * height;
+// Diffusion: 7-tap horizontal + 7-tap vertical blur of B, clamped to [0, 1].
+__global__ void diffusion_fused_kernel(const float* __restrict__ B, float* __restrict__ Aout,
+                                       int width, int height) {
+    constexpr int R  = TURING_DIFF_R;
+    constexpr int K  = 2 * R + 1;
+    constexpr int BW = TURING_TILE_W + 2 * R;
+    constexpr int BH = TURING_TILE_H + 2 * R;
+    __shared__ float sB[BH][BW];
+    __shared__ float sT[BH][TURING_TILE_W];
+
+    const int tid  = threadIdx.y * TURING_TILE_W + threadIdx.x;
+    const int nthr = TURING_TILE_W * TURING_TILE_H;
+    const int x0 = blockIdx.x * TURING_TILE_W;
+    const int y0 = blockIdx.y * TURING_TILE_H;
+    const size_t base = (size_t)blockIdx.z * width * height;
+    const float* Bb = B + base;
+    float* Ob = Aout + base;
+
+    for (int i = tid; i < BH * BW; i += nthr) {
+        int r = i / BW, c = i % BW;
+        int gy = min(max(y0 - R + r, 0), height - 1);
+        int gx = min(max(x0 - R + c, 0), width - 1);
+        sB[r][c] = Bb[gy * width + gx];
+    }
+    __syncthreads();
+
+    for (int i = tid; i < BH * TURING_TILE_W; i += nthr) {
+        int r = i / TURING_TILE_W, c = i % TURING_TILE_W;
         float sum = 0.0f;
-        for (int k = -3; k <= 3; ++k) {
-            int px = min(max(x + k, 0), width - 1);
-            sum += in[base + y * width + px] * d_k7_1d[k + 3];
-        }
-        out[base + y * width + x] = sum;
+        for (int k = 0; k < K; ++k) sum += sB[r][c + k] * d_k7_1d[k];
+        sT[r][c] = sum;
+    }
+    __syncthreads();
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int x = x0 + tx, y = y0 + ty;
+    if (x < width && y < height) {
+        float blur_val = 0.0f;
+        for (int k = 0; k < K; ++k) blur_val += sT[ty + k][tx] * d_k7_1d[k];
+        Ob[y * width + x] = fminf(fmaxf(blur_val, 0.0f), 1.0f);
     }
 }
 
-__global__ void unsharp_v_kernel(const float* in_orig, const float* in_blurred_h, float* out,
-                                 int width, int height, float strength) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        size_t base = (size_t)blockIdx.z * width * height;
-        float blur_val = 0.0f;
-        for (int k = -2; k <= 2; ++k) {
-            int py = min(max(y + k, 0), height - 1);
-            blur_val += in_blurred_h[base + py * width + x] * d_k5_1d[k + 2];
-        }
-        float current = in_orig[base + y * width + x];
-        out[base + y * width + x] = current + (current - blur_val) * strength;
+// One Turing iteration pair per loop turn: unsharp (state -> scratch), then
+// diffusion (scratch -> state). Runs `iters` iterations in place on d_state.
+// d_state and d_scratch each hold frames*width*height floats.
+static inline void turing_iterate(float* d_state, float* d_scratch, int width, int height,
+                                  int frames, int iters, hipStream_t stream) {
+    dim3 block(TURING_TILE_W, TURING_TILE_H);
+    dim3 grid((width  + TURING_TILE_W - 1) / TURING_TILE_W,
+              (height + TURING_TILE_H - 1) / TURING_TILE_H,
+              frames);
+    const float strength = TURING_SHARPEN;
+    for (int i = 0; i < iters; ++i) {
+        hipLaunchKernelGGL(unsharp_fused_kernel,   grid, block, 0, stream,
+                           d_state, d_scratch, width, height, strength);
+        hipLaunchKernelGGL(diffusion_fused_kernel, grid, block, 0, stream,
+                           d_scratch, d_state, width, height);
     }
-}
-
-__global__ void diffusion_v_kernel(const float* in_blurred_h, float* out, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x < width && y < height) {
-        size_t base = (size_t)blockIdx.z * width * height;
-        float blur_val = 0.0f;
-        for (int k = -3; k <= 3; ++k) {
-            int py = min(max(y + k, 0), height - 1);
-            blur_val += in_blurred_h[base + py * width + x] * d_k7_1d[k + 3];
-        }
-        out[base + y * width + x] = fminf(fmaxf(blur_val, 0.0f), 1.0f);
-    }
+    CHECK_HIP(hipGetLastError());
 }
 
 // --- Output ---------------------------------------------------------------
