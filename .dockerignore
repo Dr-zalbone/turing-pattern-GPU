@@ -1,0 +1,14 @@
+.git
+*.exe
+*.obj
+*.o
+*.jpg
+*.png
+*.mp4
+*.mkv
+.vscode
+.idea
+build_win.bat
+run_*.bat
+hip_shim/
+README.md
