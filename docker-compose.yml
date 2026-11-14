@@ -1,0 +1,42 @@
+services:
+  turing:
+    build:
+      context: .
+      target: turing
+      args:
+        HIP_GPU_ARCHS: "${HIP_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102}"
+    image: turing-gpu:latest
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ./:/data
+
+  live:
+    build:
+      context: .
+      target: live
+      args:
+        HIP_GPU_ARCHS: "${HIP_GPU_ARCHS:-gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102}"
+    image: turing-gpu:live
+    profiles:
+      - live
+    devices:
+      - /dev/kfd
+      - /dev/dri
+      - /dev/video0
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - ./:/data
+      - /tmp/.X11-unix:/tmp/.X11-unix
