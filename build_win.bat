@@ -28,7 +28,7 @@ if not exist "%VSWHERE%" (
     echo [ERROR] vswhere.exe not found. Please install Visual Studio with "Desktop development with C++".
     exit /b 1
 )
-for /f "usebackq tokens=*" %%V in (`"%VSWHERE%" -latest -property installationPath`) do set "VSDIR=%%V"
+for /f "usebackq tokens=*" %%V in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%V"
 if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" (
     echo [ERROR] vcvars64.bat not found under "%VSDIR%".
     exit /b 1
@@ -95,12 +95,16 @@ echo [INFO] Using library: %OPENCV_LIB%
 REM --- 4. Compile ---
 REM  -Ihip_shim          : fixes HIP-wrapper vs MSVC STL 14.51 (VS 2026) cmath clash
 REM  --offload-arch       : gfx1101 = Radeon RX 7700 XT (RDNA3). Change if needed.
+REM                         HIP_GPU_ARCH may be a space-separated list, e.g. "gfx1030 gfx1100";
+REM                         one --offload-arch=X is passed per entry.
 if "%HIP_GPU_ARCH%"=="" set "HIP_GPU_ARCH=gfx1101"
+set "ARCH_ARGS="
+for %%A in (%HIP_GPU_ARCH%) do set "ARCH_ARGS=!ARCH_ARGS! --offload-arch=%%A"
 
 if "%BUILD_LIVE%"=="0" goto :skip_live
 echo [INFO] Compiling turing_live.cpp for %HIP_GPU_ARCH% ...
 hipcc -O3 -ffast-math -std=c++17 -Wno-nan-infinity-disabled ^
-    -I"%~dp0hip_shim" --offload-arch=%HIP_GPU_ARCH% ^
+    -I"%~dp0hip_shim"!ARCH_ARGS! ^
     "%~dp0turing_live.cpp" -o "%~dp0turing_live.exe" ^
     -I"%OPENCV_DIR%\include" -L"%OPENCV_LIB_DIR%" -l%OPENCV_LIB_NAME%
 
@@ -114,7 +118,7 @@ echo [SUCCESS] Built turing_live.exe
 if "%BUILD_TURING%"=="0" goto :skip_turing
 echo [INFO] Compiling turing.cpp for %HIP_GPU_ARCH% ...
 hipcc -O3 -ffast-math -std=c++17 -Wno-nan-infinity-disabled ^
-    -I"%~dp0hip_shim" --offload-arch=%HIP_GPU_ARCH% ^
+    -I"%~dp0hip_shim"!ARCH_ARGS! ^
     "%~dp0turing.cpp" -o "%~dp0turing.exe"
 
 if %ERRORLEVEL% neq 0 (
