@@ -9,6 +9,9 @@
 #include <string>
 #include <chrono>
 #include <iomanip>
+#include <algorithm>
+#include <climits>
+#include <sstream>
 #include <hip/hip_runtime.h>
 
 #include "turing_core.h"
@@ -31,6 +34,15 @@
 // Upper bounds for command-line numbers.
 static const long kMaxDim   = 16384;
 static const long kMaxBatch = 1024;
+
+// Automatic batch size (video). Kept conservative: the GPU may be shared with
+// the desktop, and the speed-up flattens out well before this many frames.
+static const int    kAutoBatchMax        = 64;
+static const double kAutoBatchGpuShare   = 0.25;               // of free VRAM
+static const size_t kAutoBatchHostCap    = (size_t)256 << 20;  // pinned host bytes
+static const size_t kDeviceBytesPerPixel = 1 + 1 + 4 + 4;      // d_in, d_out, d_bufA, d_bufB
+static const size_t kHostBytesPerPixel   = 1 + 1;              // h_in, h_out
+static const int    kAutoBatchFallback   = 8;                  // if VRAM can't be queried
 
 // --- CPU Helpers ---
 
@@ -108,23 +120,61 @@ static bool parse_int_arg(const char* name, const std::string& text, long max_va
     return false;
 }
 
-// Ask ffprobe for the pixel size of a still image, e.g. "width=1600" /
-// "height=1200". Parsing by key keeps us independent of ffprobe's field order.
-static bool detect_image_size(const std::string& path, int& width, int& height) {
+// Ask ffprobe for the pixel size of the first video stream (a still image is
+// a one-frame video stream too), e.g. "width=1600" / "height=1200". Parsing by
+// key keeps us independent of ffprobe's field order.
+// ffmpeg auto-rotates while decoding, so a stream carrying a 90/270 degree
+// rotation (portrait phone video) is reported with width and height swapped:
+// that is the size of the frames the decoder actually hands us. Newer files
+// store it as display-matrix side data ("rotation=-90"), older ones as a
+// "rotate" tag ("TAG:rotate=90").
+static bool detect_source_size(const std::string& path, int& width, int& height) {
     std::string cmd = "ffprobe -v error -select_streams v:0 "
-                      "-show_entries stream=width,height "
+                      "-show_entries stream=width,height:stream_tags=rotate:stream_side_data=rotation "
                       "-of default=noprint_wrappers=1 " + shell_quote(path);
     FILE* pipe = popen(cmd.c_str(), POPEN_READ);
     if (!pipe) return false;
 
     width = height = 0;
-    char line[128];
+    int rotation = 0;
+    char line[256];
     while (fgets(line, sizeof(line), pipe) != NULL) {
-        if      (strncmp(line, "width=",  6) == 0) width  = atoi(line + 6);
-        else if (strncmp(line, "height=", 7) == 0) height = atoi(line + 7);
+        if      (strncmp(line, "width=",  6) == 0)      width    = atoi(line + 6);
+        else if (strncmp(line, "height=", 7) == 0)      height   = atoi(line + 7);
+        else if (strncmp(line, "rotation=", 9) == 0)    rotation = atoi(line + 9);
+        else if (strncmp(line, "TAG:rotate=", 11) == 0) rotation = atoi(line + 11);
     }
     pclose(pipe);
-    return width > 0 && height > 0;
+    if (width <= 0 || height <= 0) return false;
+    int angle = ((rotation % 360) + 360) % 360;
+    if (angle == 90 || angle == 270) std::swap(width, height);
+    return true;
+}
+
+// Largest batch that comfortably fits: at most kAutoBatchGpuShare of the free
+// VRAM, at most kAutoBatchHostCap of pinned host memory, at most kAutoBatchMax
+// frames, never more frames than the video has, and small enough that 32-bit
+// kernel indexing (blockIdx.x * blockDim.x) can't overflow.
+static int auto_batch_size(size_t pixels_per_frame, long total_frames, std::string& why) {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess || free_bytes == 0) {
+        (void)hipGetLastError();
+        why = "auto, GPU memory unknown";
+        return kAutoBatchFallback;
+    }
+
+    size_t by_gpu  = (size_t)(free_bytes * kAutoBatchGpuShare) / (pixels_per_frame * kDeviceBytesPerPixel);
+    size_t by_host = kAutoBatchHostCap / (pixels_per_frame * kHostBytesPerPixel);
+    size_t by_idx  = (size_t)INT_MAX / pixels_per_frame;
+
+    size_t batch = std::min({ (size_t)kAutoBatchMax, by_gpu, by_host, by_idx });
+    if (total_frames > 0) batch = std::min(batch, (size_t)total_frames);
+    if (batch < 1) batch = 1;
+
+    std::ostringstream os;
+    os << "auto, " << (free_bytes >> 20) << " MiB GPU memory free";
+    why = os.str();
+    return (int)batch;
 }
 
 // Accept "N" or "N/D" with both parts greater than zero. ffprobe reports
@@ -210,8 +260,11 @@ void draw_progress_bar(long current, long total, double elapsed_seconds) {
 }
 
 static void print_usage_video() {
-    std::cerr << "Usage: ./turing <input> <output> <width> <height> [batch_size]\n"
-              << "       [--no-audio]  don't copy the source audio into the output\n";
+    std::cerr << "Usage: ./turing <input> <output> [width height] [--batch N] [--no-audio]\n"
+              << "       width height  output size (default: the source size)\n"
+              << "       --batch N     frames per GPU batch, 1-" << kMaxBatch
+              << " (default: picked from free GPU memory)\n"
+              << "       --no-audio    don't copy the source audio into the output\n";
 }
 
 static void print_usage_photo() {
@@ -228,10 +281,26 @@ int main(int argc, char** argv) {
     // Flags may appear anywhere on the command line and are stripped first, so
     // every positional argument keeps the position it has always had.
     bool copy_audio = true;
+    bool batch_given = false;          // --batch / -b / --batch=N seen
+    std::string batch_flag;
     std::vector<const char*> pos;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--no-audio" || arg == "-an") { copy_audio = false; continue; }
+        if (arg == "--batch" || arg == "-b") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " needs a value, e.g. " << arg << " 16\n";
+                return 1;
+            }
+            batch_given = true;
+            batch_flag = argv[++i];
+            continue;
+        }
+        if (arg.compare(0, 8, "--batch=") == 0) {
+            batch_given = true;
+            batch_flag = arg.substr(8);
+            continue;
+        }
         pos.push_back(argv[i]);
     }
 
@@ -257,6 +326,7 @@ int main(int argc, char** argv) {
 
     int width = 0, height = 0;
     int batch_size = 1;
+    std::string batch_source;          // shown in the "Batch size" line; empty = auto
     std::string frame_rate = "30/1";
 
     if (image_mode) {
@@ -272,7 +342,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else if (pos.size() == 2) {
-            if (!detect_image_size(input_path, width, height)) {
+            if (!detect_source_size(input_path, width, height)) {
                 std::cerr << "Error: could not read image dimensions from " << input_path
                           << ".\nPass them explicitly: ./turing <input> <output> <width> <height>\n";
                 return 1;
@@ -282,35 +352,84 @@ int main(int argc, char** argv) {
             print_usage_photo();
             return 1;
         }
+        if (batch_given) std::cerr << "Note: --batch is ignored in photo mode\n";
         batch_size = 1;
     } else {
-        if (pos.size() < 4 || pos.size() > 5) {
+        // in out | in out W H | in out W H batch (old form, still accepted)
+        if (pos.size() != 2 && pos.size() != 4 && pos.size() != 5) {
             print_usage_video();
             return 1;
         }
-        if (!parse_int_arg("width", pos[2], kMaxDim, width) ||
-            !parse_int_arg("height", pos[3], kMaxDim, height)) {
-            print_usage_video();
+        if (pos.size() == 5 && batch_given) {
+            std::cerr << "Error: batch size given both as a 5th argument and with --batch; use only --batch\n";
             return 1;
         }
-        batch_size = 32;
-        if (pos.size() == 5 && !parse_int_arg("batch_size", pos[4], kMaxBatch, batch_size)) {
-            print_usage_video();
-            return 1;
+        if (batch_given) {
+            if (!parse_int_arg("--batch", batch_flag, kMaxBatch, batch_size)) {
+                print_usage_video();
+                return 1;
+            }
+            batch_source = "--batch";
         }
-        if (width % 2 != 0 || height % 2 != 0) {
-            std::cerr << "Error: video output needs even width and height for yuv420p "
-                         "(got " << width << "x" << height << ")\n";
-            return 1;
+        if (pos.size() == 5) {
+            if (!parse_int_arg("batch_size", pos[4], kMaxBatch, batch_size)) {
+                print_usage_video();
+                return 1;
+            }
+            batch_source = "5th argument";
+            std::cerr << "Note: the positional batch_size is deprecated; use --batch "
+                      << batch_size << " instead\n";
+        }
+
+        if (pos.size() >= 4) {
+            if (!parse_int_arg("width", pos[2], kMaxDim, width) ||
+                !parse_int_arg("height", pos[3], kMaxDim, height)) {
+                print_usage_video();
+                return 1;
+            }
+            if (width % 2 != 0 || height % 2 != 0) {
+                std::cerr << "Error: video output needs even width and height for yuv420p "
+                             "(got " << width << "x" << height << ")\n";
+                return 1;
+            }
+        } else {
+            if (!detect_source_size(input_path, width, height)) {
+                std::cerr << "Error: could not read the video size from " << input_path
+                          << ".\nPass it explicitly: ./turing <input> <output> <width> <height>\n";
+                return 1;
+            }
+            if (width > kMaxDim || height > kMaxDim) {
+                std::cerr << "Error: source is " << width << "x" << height << ", larger than "
+                          << kMaxDim << "; pass a smaller <width> <height> to downscale\n";
+                return 1;
+            }
+            // yuv420p needs even sizes; drop the odd row/column rather than fail.
+            int even_w = width & ~1, even_h = height & ~1;
+            if (even_w < 2 || even_h < 2) {
+                std::cerr << "Error: source is too small (" << width << "x" << height << ")\n";
+                return 1;
+            }
+            std::cout << "Detected " << width << "x" << height << " from " << input_path;
+            if (even_w != width || even_h != height)
+                std::cout << " (using " << even_w << "x" << even_h << ": yuv420p needs even sizes)";
+            std::cout << std::endl;
+            width = even_w;
+            height = even_h;
         }
         frame_rate = detect_frame_rate(input_path);
     }
 
     size_t pixels_per_frame = (size_t)width * (size_t)height;
-    size_t batch_pixels = pixels_per_frame * (size_t)batch_size;
     int iterations = TURING_ITERS_OFFLINE;
 
     long total_frames = image_mode ? 0 : get_total_frames(input_path);
+
+    if (!image_mode) {
+        if (batch_source.empty())
+            batch_size = auto_batch_size(pixels_per_frame, total_frames, batch_source);
+        std::cout << "Batch size: " << batch_size << " (" << batch_source << ")" << std::endl;
+    }
+    size_t batch_pixels = pixels_per_frame * (size_t)batch_size;
 
     upload_gaussian_constants();
 

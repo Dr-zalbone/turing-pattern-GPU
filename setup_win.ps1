@@ -360,7 +360,7 @@ function Write-NextSteps {
     Write-Host ''
     Write-Host 'Next steps (in a NEW terminal if anything was installed, so PATH is up to date):'
     if ($Target -ne 'live') {
-        Write-Host '  run_turing.bat input.mp4 output.mp4 1920 1080 64'
+        Write-Host '  run_turing.bat input.mp4 output.mp4'
         Write-Host '  run_turing.bat photo.jpg output.png'
     }
     if ($Target -ne 'turing') {

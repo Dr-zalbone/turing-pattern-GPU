@@ -2,10 +2,11 @@
 setlocal
 REM  Launches turing.exe with the HIP DLL paths it needs on PATH.
 REM  Usage:
-REM    run_turing.bat <input> <output> <width> <height> [batch_size]   video
-REM    run_turing.bat <input> <output>                                  photo
+REM    run_turing.bat <input> <output> [width height] [--batch N] [--no-audio]   video
+REM    run_turing.bat <input> <output>                                           photo
 REM  e.g.
-REM    run_turing.bat input.mp4 output.mp4 1920 1080 64
+REM    run_turing.bat input.mp4 output.mp4
+REM    run_turing.bat input.mp4 output.mp4 1280 720 --batch 16
 REM    run_turing.bat photo.jpg output.png
 
 if "%HIP_PATH%"=="" for /d %%D in ("C:\Program Files\AMD\ROCm\*") do set "HIP_PATH=%%D"

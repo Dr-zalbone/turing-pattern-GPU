@@ -143,6 +143,11 @@ cli_tests() {
     cli_expect "no arguments" "Usage"
     cli_expect "video mode with 3 positionals" "Usage" in.mp4 out.mp4 320
     cli_expect "photo mode with out.txt" "extension" in.png out.txt
+    cli_expect "--batch 0" "must be a whole number" in.mp4 out.mp4 --batch 0
+    cli_expect "--batch abc" "must be a whole number" in.mp4 out.mp4 --batch abc
+    cli_expect "--batch 2000" "must be a whole number" in.mp4 out.mp4 --batch 2000
+    cli_expect "--batch as last arg" "needs a value" in.mp4 out.mp4 --batch
+    cli_expect "positional and --batch together" "both" in.mp4 out.mp4 160 120 8 --batch 4
 }
 
 gpu_tests() {
@@ -210,26 +215,33 @@ video_tests() {
 
     local in="$TMP_DIR/in.mp4" out="$TMP_DIR/out.mp4" out_na="$TMP_DIR/out_na.mp4"
     local ntsc_in="$TMP_DIR/ntsc.mp4" out_ntsc="$TMP_DIR/out_ntsc.mp4" log="$TMP_DIR/video.log"
+    local out_legacy="$TMP_DIR/out_legacy.mp4" out_scaled="$TMP_DIR/out_scaled.mp4"
+    local rot_in="$TMP_DIR/rot.mp4" out_rot="$TMP_DIR/out_rot.mp4"
     if ! ffmpeg -v error -f lavfi -i testsrc=size=160x120:rate=24 \
                 -f lavfi -i sine=frequency=440:sample_rate=48000 \
                 -t 1 -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$in"; then
         fail "could not generate video test input"; return 0
     fi
 
-    # 1) 24 fps source, 8-frame batches, audio copied.
-    if turing "$in" "$out" 160 120 8 >"$log" 2>&1; then
-        pass "turing in.mp4 out.mp4 160 120 8 exits 0"
+    # 1) 24 fps source, manual 8-frame batch, audio copied, source size (no dims given).
+    if turing "$in" "$out" --batch 8 >"$log" 2>&1; then
+        pass "turing in.mp4 out.mp4 --batch 8 exits 0"
+        if grep -q 'Batch size: 8' "$log"; then pass "reports 'Batch size: 8'"
+        else fail "no 'Batch size: 8' line in output: $(tail -n 1 "$log")"; fi
+        check_dims "$out" 160 120 "out.mp4"
         check_rate "$out" "24/1"
         check_frames "$out" 23 25
         if has_stream "$out" a; then pass "output has an audio stream"
         else fail "output has no audio stream"; fi
     else
-        fail "turing in.mp4 out.mp4 160 120 8 failed: $(tail -n 1 "$log")"
+        fail "turing in.mp4 out.mp4 --batch 8 failed: $(tail -n 1 "$log")"
     fi
 
-    # 2) --no-audio (flag placed after the positionals, which is allowed).
-    if turing "$in" "$out_na" 160 120 8 --no-audio >"$log" 2>&1 && [ -s "$out_na" ]; then
+    # 2) --no-audio with automatic batch size.
+    if turing "$in" "$out_na" --no-audio >"$log" 2>&1 && [ -s "$out_na" ]; then
         pass "--no-audio run exits 0"
+        if grep -q 'Batch size: [0-9]* (auto' "$log"; then pass "automatic batch size reported"
+        else fail "no 'Batch size: N (auto...)' line in --no-audio output"; fi
         if has_stream "$out_na" a; then fail "--no-audio output still has an audio stream"
         else pass "--no-audio output has no audio stream"; fi
     else
@@ -240,10 +252,36 @@ video_tests() {
     if ! ffmpeg -v error -f lavfi -i testsrc=size=160x120:rate=30000/1001 -t 1 \
                 -c:v libx264 -pix_fmt yuv420p "$ntsc_in"; then
         fail "could not generate NTSC test input"
-    elif turing "$ntsc_in" "$out_ntsc" 160 120 4 >"$log" 2>&1; then
+    elif turing "$ntsc_in" "$out_ntsc" -b 4 >"$log" 2>&1; then
         check_rate "$out_ntsc" "30000/1001"
     else
         fail "NTSC run failed: $(tail -n 1 "$log")"
+    fi
+
+    # 4) Legacy 5th positional batch still works, with a deprecation notice.
+    if turing "$in" "$out_legacy" 160 120 8 >"$log" 2>&1 && [ -s "$out_legacy" ]; then
+        pass "legacy positional batch run exits 0"
+        if grep -q 'deprecated' "$log"; then pass "legacy batch form prints 'deprecated'"
+        else fail "legacy batch form printed no 'deprecated' notice"; fi
+    else
+        fail "legacy positional batch run failed: $(tail -n 1 "$log")"
+    fi
+
+    # 5) Explicit rescale to 96x64.
+    if turing "$in" "$out_scaled" 96 64 >"$log" 2>&1; then
+        check_dims "$out_scaled" 96 64 "rescaled output"
+    else
+        fail "turing in.mp4 out.mp4 96 64 failed: $(tail -n 1 "$log")"
+    fi
+
+    # 6) Rotation metadata: a 160x120 clip rotated 90 degrees must come out 120x160.
+    # -display_rotation is an input option (ffmpeg >= 6.1): tag a stream copy of the test clip.
+    if ! ffmpeg -v error -display_rotation:v:0 90 -i "$in" -c copy "$rot_in" 2>/dev/null; then
+        skip "rotation metadata not supported by this ffmpeg"
+    elif turing "$rot_in" "$out_rot" >"$log" 2>&1; then
+        check_dims "$out_rot" 120 160 "rotated output"
+    else
+        fail "rotated run failed: $(tail -n 1 "$log")"
     fi
 }
 

@@ -59,8 +59,10 @@ docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-ad
 Video:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined -v "$PWD":/data turing-gpu turing input.mp4 output.mp4 1920 1080 64
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined -v "$PWD":/data turing-gpu turing input.mp4 output.mp4
 ```
+
+The optional width/height, `--batch` and `--no-audio` arguments go after the file names. See *Execution* under [Linux / WSL2](#linux--wsl2) for what they do.
 
 > [!NOTE]
 > `turing-gpu photo.jpg output.png` will not work. The entrypoint runs its arguments as the command (`exec "$@"`), so `turing` has to come first.
@@ -70,7 +72,7 @@ docker run --rm --device /dev/kfd --device /dev/dri --group-add video --group-ad
 The `turing` service in `docker-compose.yml` mounts the project folder at `/data` and passes the same devices and groups:
 
 ```bash
-docker compose run --rm turing turing input.mp4 output.mp4 1920 1080 64
+docker compose run --rm turing turing input.mp4 output.mp4
 ```
 
 To build it for a single target: `HIP_GPU_ARCHS=gfx1101 docker compose build turing`.
@@ -94,7 +96,7 @@ The container runs a self-test on every start, before the requested command:
 1. **toolchain**: `turing` is on `PATH` and its shared libraries resolve, `ffmpeg` and `ffprobe` are present, and ffmpeg has the `libx264` encoder.
 2. **cli**: bad invocations are rejected with a usage or extension message.
 3. **gpu**: AMD GPUs visible to `rocminfo`.
-4. **photo** and **video** (only when a GPU is visible): end-to-end renders checked with ffprobe. Photo: output size matches the input, output is grayscale, has contrast, and JPEG output works. Video: size matches, frame rate is preserved exactly at `24/1` and `30000/1001`, frame count is right, source audio is copied, and `--no-audio` produces no audio stream.
+4. **photo** and **video** (only when a GPU is visible): end-to-end renders checked with ffprobe. Photo: output size matches the input, output is grayscale, has contrast, and JPEG output works. Video: size matches, size auto-detected when width/height are omitted, frame rate is preserved exactly at `24/1` and `30000/1001`, frame count is right, source audio is copied, `--no-audio` produces no audio stream, and `--batch` and auto batch both work.
 
 Quiet output prints one line per section and a summary:
 
@@ -172,29 +174,39 @@ Photo mode is compiled into the same `turing.cpp`, so the commands above already
 
 ##### Execution
 
-Process video files directly with VRAM batching:
+Process video files directly:
 
 ```bash
-./turing <input_path> <output_path> <width> <height> [batch_size]
+./turing <input_path> <output_path> [width height] [--batch N] [--no-audio]
 
 ```
 
-Example:
+Examples:
 
 ```bash
-./turing input.mp4 output.mp4 1920 1080 64
+./turing input.mp4 output.mp4
+./turing input.mp4 output.mp4 1280 720 --batch 16
 
 ```
 
-`width` and `height` set the output size: the source is scaled to it, so they don't have to match the input. Video needs even values (libx264 `yuv420p`). `batch_size` defaults to 32. The program exits non-zero if ffmpeg fails to decode or encode, so it is safe to use in scripts.
+The **width and height are optional**. If you leave them out, the output keeps the source size. The size is read with `ffprobe` and corrected for rotation metadata, so a portrait phone video gives the rotated size. An odd auto-detected size is rounded down to even, because libx264 `yuv420p` needs even values. Pass `width height` to rescale: the source is scaled to that size, and it doesn't have to match the input. Explicitly given video sizes must be even, and odd values are an error. The program exits non-zero if ffmpeg fails to decode or encode, so it is safe to use in scripts.
+
+**Batch size** is the number of frames sent to the GPU at once. It is chosen automatically. The program estimates GPU memory per frame (about 10 bytes per pixel on the GPU and 2 bytes per pixel of pinned host memory), uses at most 25% of the free GPU memory reported by HIP, caps pinned host memory at 256 MiB, and caps the result at 64 frames and at the video's frame count. It prints the choice, for example `Batch size: 64 (auto, 12126 MiB GPU memory free)`. Photos always use 1.
+
+Use `--batch N` (or `-b N`, or `--batch=N`; N from 1 to 1024) to override the automatic value:
+
+* Lower it if you run out of GPU memory, or if you share the GPU with a display or other GPU work.
+* Raise it only for small frames.
+
+The old fifth positional argument (`turing in.mp4 out.mp4 W H 64`) still works but prints a deprecation note. Use `--batch 64` instead. Giving both a fifth positional value and `--batch` is an error.
 
 The output keeps the **source frame rate**, probed with `ffprobe`, so `24`, `30`, `60` and `29.97` (`30000/1001`) all come out right instead of being forced to 30. It also **copies the source audio** across untouched. Pass `--no-audio` (or `-an`) to write a silent video:
 
 ```bash
-./turing input.mp4 output.mp4 1920 1080 64 --no-audio
+./turing input.mp4 output.mp4 --no-audio
 ```
 
-The flag can go anywhere on the command line, and if the source has no audio stream the output simply has none either.
+The flags can go anywhere on the command line, and if the source has no audio stream the output simply has none either.
 
 Process a single image the same way as a video file, except **the width and height are read from the image itself**, so you normally don't pass them:
 
@@ -205,7 +217,7 @@ Process a single image the same way as a video file, except **the width and heig
 
 * **Input** is whatever the *input* extension says it is: `jpg · jpeg · png · bmp · webp · tif · tiff · pgm · ppm`. That is how the binary chooses between photo mode and video mode, so the video invocation above is untouched. Point it at a video with no dimensions and you still get exactly the same usage message.
 * **Output** format comes from the *output* extension: `.png` stays grayscale, `.jpg` is JPEG-encoded.
-* Everything else matches video mode: sigma 1.0 / 1.8, sharpen 5.0, 100 iterations, grayscale end to end. Photo mode is video mode with `batch_size = 1` and a single still frame pushed through the same `turing_core.h` kernels.
+* Everything else matches video mode: sigma 1.0 / 1.8, sharpen 5.0, 100 iterations, grayscale end to end. Photo mode is video mode with batch size 1 and a single still frame pushed through the same `turing_core.h` kernels.
 
 ## Windows
 
@@ -257,13 +269,14 @@ Parameters:
 Run these from the repo folder:
 
 ```powershell
-.\run_turing.bat input.mp4 output.mp4 1920 1080 64
+.\run_turing.bat input.mp4 output.mp4
+.\run_turing.bat input.mp4 output.mp4 1280 720 --batch 16
 .\run_turing.bat photo.jpg output.png
 .\run_live.bat           # camera 0
 .\run_live.bat 1         # camera 1
 ```
 
-The `run_*.bat` launchers put the HIP and OpenCV DLL directories on `PATH` for you. The input and output rules for `run_turing.bat` are the same as on Linux (see *Process a single image* under [Linux / WSL2](#linux--wsl2)). For what the camera app prints on startup and how to check the stream format, see **Execution** under *Manual setup* below.
+The `run_*.bat` launchers put the HIP and OpenCV DLL directories on `PATH` for you. The input and output rules for `run_turing.bat` are the same as on Linux (see *Process a single image* under [Linux / WSL2](#linux--wsl2)). The video options (optional width/height, `--batch`, `--no-audio`) are the same too, see *Execution* under [Linux / WSL2](#linux--wsl2). For what the camera app prints on startup and how to check the stream format, see **Execution** under *Manual setup* below.
 
 ### Manual setup
 
